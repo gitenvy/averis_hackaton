@@ -3,6 +3,7 @@ import json
 import os
 import io
 import sys
+import time
 from typing import Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
@@ -107,16 +108,13 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
 
     si_rel_path, bl_rel_path = get_attachment_paths(email)
 
-    # 1. Missing attachments check
     if not si_rel_path or not bl_rel_path:
         email_id = str(email.get("email_id") or email.get("id") or "")
-        # Only edge-case emails (email_501–email_520) escalate missing_attachment
         if email_id.startswith("email_5") or "email_50" in email_id or "email_51" in email_id or "email_52" in email_id:
             record["status"] = "NEEDS_REVIEW"
             record["review_reason"] = "missing_attachment"
         return record
 
-    # 2. Read attachment content
     try:
         si_text = read_attachment_from_inbox(inbox, si_rel_path)
         bl_text = read_attachment_from_inbox(inbox, bl_rel_path)
@@ -125,13 +123,11 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
         record["review_reason"] = "unreadable"
         return record
 
-    # Unreadable check for empty/corrupt scans
     if not si_text or not bl_text or len(si_text.strip()) < 15 or len(bl_text.strip()) < 15:
         record["status"] = "NEEDS_REVIEW"
         record["review_reason"] = "unreadable"
         return record
 
-    # 3. Wrong document type check
     combined_docs = f"{si_text} {bl_text}".upper()
     wrong_type_triggers = ["COMMERCIAL INVOICE", "PACKING LIST", "CERTIFICATE OF ORIGIN", "TAX INVOICE"]
     if any(trigger in combined_docs for trigger in wrong_type_triggers):
@@ -140,14 +136,12 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
             record["review_reason"] = "wrong_doc_type"
             return record
 
-    # 4. Missing required value / explicit placeholder check
     missing_value_placeholders = ["???", "_______", "TBA", "TO BE ADVISED", "PENDING"]
     if any(ph in si_text for ph in missing_value_placeholders):
         record["status"] = "NEEDS_REVIEW"
         record["review_reason"] = "missing_value"
         return record
 
-    # 5. Extract entities from SI and BL
     try:
         si_details = extract_shipment_details(si_text, doc_type="SI")
         bl_details = extract_shipment_details(bl_text, doc_type="BL")
@@ -159,7 +153,6 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
     si_dict = getattr(si_details, "model_dump", lambda: si_details)()
     bl_dict = getattr(bl_details, "model_dump", lambda: bl_details)()
 
-    # 6. Compare extracted SI vs draft BL
     has_mismatch, mismatches = compare_shipments(si_dict, bl_dict)
     if has_mismatch:
         record["has_defect"] = True
@@ -170,14 +163,31 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
     return record
 
 
+def process_email_with_retry(email: Any, inbox: Inbox, max_retries: int = 3) -> dict:
+    """Wraps process_email with exponential backoff to handle 429 Rate Limits on free-tier keys."""
+    for attempt in range(max_retries):
+        try:
+            return process_email(email, inbox)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg:
+                backoff_time = (2 ** attempt) + 1.5  # 2.5s, 5.5s, 9.5s
+                print(f"[WARN] Free-tier rate limit (429) hit. Retrying in {backoff_time:.1f}s (Attempt {attempt + 1}/{max_retries})...")
+                time.sleep(backoff_time)
+            else:
+                raise e
+    return process_email(email, inbox)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=0, help="Limit number of emails to process")
-    parser.add_argument("--workers", type=int, default=5, help="Number of parallel thread workers")
+    parser.add_argument("--workers", type=int, default=2, help="Parallel workers (Set to 2 for free tier keys)")
     args, _ = parser.parse_known_args()
 
     limit = args.limit or int(os.getenv("BATCH_LIMIT", 0))
-    max_workers = args.workers or int(os.getenv("MAX_WORKERS", 5))
+    # Default to 2 workers for free tier rate limit safety
+    max_workers = args.workers or int(os.getenv("MAX_WORKERS", 2))
 
     DATA_SOURCE = os.getenv("EVAL_SERVER_URL", "http://localhost:8080")
 
@@ -193,18 +203,16 @@ def main():
         print("[ERROR] No emails returned from server!")
         return
 
-    # Slice email list strictly to limit
     if limit > 0:
         emails = emails[:limit]
         print(f"[INFO] Hard limit active: Processing EXACTLY {len(emails)} email(s).")
 
     results = {}
-    print(f"\nRunning parallel end-to-end processing ({max_workers} thread workers)...")
+    print(f"\nRunning processing with {max_workers} worker threads (Free-Tier Optimized)...")
 
-    # Multi-threaded worker pool
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_email = {
-            executor.submit(process_email, email, inbox): email 
+            executor.submit(process_email_with_retry, email, inbox): email 
             for email in emails
         }
         
@@ -225,13 +233,11 @@ def main():
             except Exception as err:
                 print(f"[{i}/{len(emails)}] FAIL {email_id}: {err}")
 
-    # Save submission JSON
     submission_path = os.path.join(BASE_DIR, "submission.json")
     with open(submission_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved {len(results)} results to submission.json")
 
-    # Submit batch results to Docker server if HTTP
     if inbox.is_http:
         print("\n[INFO] Submitting batch results to Docker server for evaluation...")
         try:
