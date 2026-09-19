@@ -4,7 +4,6 @@ import os
 import io
 import sys
 import time
-import zipfile
 from typing import Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
@@ -191,20 +190,9 @@ def main():
 
     DATA_SOURCE = os.getenv("EVAL_SERVER_URL", "http://localhost:8080")
     
-    # Offline paths
-    zip_file = os.path.join(BASE_DIR, "offline_inbox.zip")
+    # Local folder fallbacks
     offline_dir = os.path.join(BASE_DIR, "offline_inbox")
     fallback_data_dir = os.path.join(BASE_DIR, "data_averis")
-
-    # Auto-extract offline_inbox.zip if unextracted
-    if not os.path.exists(offline_dir) and os.path.exists(zip_file):
-        print(f"[INFO] Unpacking '{zip_file}'...")
-        try:
-            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                zip_ref.extractall(BASE_DIR)
-            print("[INFO] Extraction complete!")
-        except Exception as e:
-            print(f"[ERROR] Failed to extract {zip_file}: {e}")
 
     inbox = None
 
@@ -216,9 +204,9 @@ def main():
             print(f"[INFO] Connected to Docker server at '{DATA_SOURCE}'. Total emails: {len(emails)}")
         except Exception as e:
             print(f"[WARN] Could not reach Docker server at '{DATA_SOURCE}': {e}")
-            print("[INFO] Falling back to offline dataset...")
+            print("[INFO] Falling back to local offline folder...")
 
-    # 2. Fallback to offline dataset directory
+    # 2. Fallback to offline_inbox folder (or data_averis)
     if inbox is None or not DATA_SOURCE.startswith("http"):
         target_local_path = offline_dir if os.path.exists(offline_dir) else fallback_data_dir
         try:
@@ -226,7 +214,7 @@ def main():
             emails = list(inbox)
             print(f"[INFO] Plug-and-Play Mode: Loaded {len(emails)} emails from '{target_local_path}'.")
         except Exception as e:
-            print(f"[ERROR] Could not load offline inbox dataset: {e}")
+            print(f"[ERROR] Could not load offline inbox dataset from '{target_local_path}': {e}")
             return
 
     if not emails:
