@@ -8,7 +8,7 @@ This solution automatically parses multi-channel logistics emails, classifies in
 
 ## ☁️ System Architecture & Cloud Integration
 
-The solution is architected around a decoupled **3-Tier Cloud Architecture** utilizing Groq LPU acceleration and serverless hosting:
+The solution is architected around a decoupled **3-Tier Cloud Architecture** utilizing OpenRouter LLM routing and serverless hosting:
 
 ```
                   ┌───────────────────────────────────────────────┐
@@ -25,7 +25,7 @@ The solution is architected around a decoupled **3-Tier Cloud Architecture** uti
                                           ▼
 ┌─────────────────────────────────────────┴─────────────────────────────────────────┐
 │                               Cloud AI Inference Layer                            │
-│                 Groq LPU Acceleration (Dynamic Model Selection)                   │
+│                  OpenRouter API (Dynamic Multi-Provider Selection)                │
 └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                           │
                                           ▼
@@ -35,22 +35,22 @@ The solution is architected around a decoupled **3-Tier Cloud Architecture** uti
                   └───────────────────────┴───────────────────────┘
 ```
 
-1. **Cloud AI Inference Layer**: Powered by **Groq Cloud LPU Infrastructure** for ultra-low latency (~300ms) semantic email classification and multi-modal document entity extraction.
+1. **Cloud AI Inference Layer**: Powered by **OpenRouter API** for flexible model routing, ultra-low latency semantic email classification, and multi-modal document entity extraction.
 2. **Cloud Application Layer**: Deployed serverless via **Streamlit Cloud** for live batch auditing, manual JSON document inspection, and real-time operational metrics.
 3. **Containerized Evaluation Engine**: Local/Cloud REST microservice hosting private evaluation dataset endpoints (`POST /submit`).
 
 ---
 
-## 🤖 Groq Model Configuration
+## 🤖 OpenRouter Model Configuration
 
-The application dynamically selects the Groq LLM model via environment variables (`GROQ_MODEL`), allowing instant model swapping without code changes.
+The application dynamically selects the LLM model via environment variables (`OPENROUTER_MODEL`), allowing instant model swapping without code changes across top provider models.
 
 | Model ID | Recommended Use Case | Latency |
 | :--- | :--- | :--- |
-| `llama-3.3-70b-versatile` | **Default / Production.** Best precision for complex entity extraction & edge cases. | ~500ms |
-| `allam-2-7b` | Specialized for Arabic & multilingual logistics text. | ~200ms |
-| `llama-3.1-8b-instant` | High-speed classification for high-throughput batching. | ~100ms |
-| `mixtral-8x7b-32768` | Long-context handling for dense, multi-page attached spreadsheets. | ~400ms |
+| `meta-llama/llama-3.3-70b-instruct` | **Default / Production.** Excellent precision for complex entity extraction & edge cases. | ~500ms |
+| `anthropic/claude-3.5-sonnet` | Highest reasoning capability for tricky document formats & noisy text. | ~800ms |
+| `deepseek/deepseek-chat` | Highly cost-effective & fast for high-volume batch processing. | ~300ms |
+| `qwen/qwen-2.5-72b-instruct` | Strong structured JSON output generation and multilingual support. | ~400ms |
 
 ---
 
@@ -82,7 +82,7 @@ shipping_verifier/
 * **Python 3.10+** installed
 * **Docker Desktop** installed and running
 * **Node.js / npx** installed (required for port forwarding to Streamlit Cloud)
-* A **Groq API Key** ([Obtain key from Groq Console](https://console.groq.com/))
+* An **OpenRouter API Key** ([Obtain key from OpenRouter Keys Console](https://openrouter.ai/keys))
 
 ### 1. Clone & Set Up Virtual Environment
 
@@ -109,8 +109,8 @@ pip install -r requirements.txt
 Create a `.env` file in the root `shipping_verifier/` directory:
 
 ```env
-GROQ_API_KEY=gsk_your_actual_groq_api_key_here
-GROQ_MODEL=llama-3.3-70b-versatile
+OPENROUTER_API_KEY=sk-or-v1-your_actual_openrouter_api_key_here
+OPENROUTER_MODEL=meta-llama/llama-3.3-70b-instruct
 ```
 
 ---
@@ -137,7 +137,7 @@ This will:
 1. Fetch evaluation emails from `http://localhost:8080`.
 2. Classify intent (`BL_COMPARISON`, `SI_REQUEST`, `INVOICE_QUERY`, `GENERAL`, `SPAM`).
 3. Extract shipment details for target fields (`shipper`, `consignee`, `port_of_loading`, `port_of_discharge`, `vessel`, etc.).
-4. Compare document pairs for discrepancies and flag necessary human review cases.
+4. Compare document pairs for discrepancies and flag necessary human review cases (`missing_attachment`, `unreadable`, `wrong_doc_type`, `missing_value`).
 5. Save `submission.json` and submit directly to `/submit` for live scoreboard evaluation.
 
 ---
@@ -162,8 +162,8 @@ Access the web dashboard at `http://localhost:8501`.
 3. Connect your repository and set `app.py` as the main entry point.
 4. Under **Advanced Settings -> Secrets**, configure your keys in TOML format:
    ```toml
-   GROQ_API_KEY = "gsk_your_actual_groq_api_key_here"
-   GROQ_MODEL = "llama-3.3-70b-versatile"
+   OPENROUTER_API_KEY = "sk-or-v1-your_actual_openrouter_api_key_here"
+   OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct"
    ```
 
 #### 2. Connect Streamlit Cloud to Local Docker Server via Localtunnel (`npx`)
@@ -199,6 +199,13 @@ Submissions are formatted and graded according to the official SDOC specificatio
 }
 ```
 
+### Reliability & Escalation Taxonomy
+The `review_reason` parameter must strictly match one of the following canonical error keys when `status == "NEEDS_REVIEW"`:
+- `missing_attachment`: Missing required SI or BL attachment files.
+- `unreadable`: Corrupted file format, unparseable binary, or failed extraction.
+- `wrong_doc_type`: Attached file is not a valid Shipping Instruction or Bill of Lading (e.g., invoice/packing list).
+- `missing_value`: Critical target comparison field is missing or null across documents.
+
 ### Scoring Model Formula
 $$\text{Final Score} = 0.30 \times \text{Stage1\_MacroF1} + 0.20 \times \text{Stage3\_DefectF1} + 0.50 \times \text{EndToEnd\_SuccessRate}$$
 
@@ -208,6 +215,9 @@ $$\text{Final Score} = 0.30 \times \text{Stage1\_MacroF1} + 0.20 \times \text{St
 
 ### Fast-Track Commands
 ```powershell
+# Bypasses script execution blocking in Windows PowerShell if needed
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
 # Re-run pipeline locally
 python main.py
 
@@ -216,6 +226,6 @@ npx localtunnel --port 8080
 ```
 
 ### Common Pitfalls
-1. **Missing `.env` File**: Ensure `.env` is created locally in the root directory containing `GROQ_API_KEY` and `GROQ_MODEL`.
+1. **Missing `.env` File**: Ensure `.env` is created locally in the root directory containing `OPENROUTER_API_KEY` and `OPENROUTER_MODEL`.
 2. **Docker Connection Error**: Verify Docker Desktop is active and running `docker compose up` inside `data_averis`.
 3. **Streamlit Cloud Localhost Error**: Do not use `http://localhost:8080` inside the public Streamlit Cloud interface. Use **Tab 2 (Single File Inspection)** or set up `npx localtunnel --port 8080` to pass the public URL.
