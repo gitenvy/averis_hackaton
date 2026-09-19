@@ -1,15 +1,22 @@
 import json
 import os
+import io
 from typing import Any, Optional, Tuple
-from data_averis import loader
-from classifier import classify_email
-from reader import read_attachment
-from extractor import  extract_shipment_details
-from comparator import compare_shipments, TARGET_FIELDS
+import pandas as pd
 from dotenv import load_dotenv
+
+# Flexible import depending on your project folder structure
+import sys
+import os
+
+# Add the 'data_averis' folder to Python's path so loader.py can be found
+from data_averis.server.loader import Inbox
+
+from classifier import classify_email
+from extractor import extract_shipment_details
+from comparator import compare_shipments, TARGET_FIELDS
+
 load_dotenv()
-
-
 
 # Category mapping — aligns internal classifier labels with the spec's enum values
 CATEGORY_MAP = {
@@ -44,7 +51,6 @@ def get_attachment_paths(email_obj: Any) -> Tuple[Optional[str], Optional[str]]:
                     bl_path = path
             elif isinstance(item, str):
                 item_lower = item.lower()
-                # Matches _si., _si_v1., si_doc, shipping_instruction, or ending with _si
                 if any(pattern in item_lower for pattern in ["_si.", "_si_", "shipping_instruction", "/si_"]) or item_lower.endswith("_si"):
                     si_path = item
                 elif any(pattern in item_lower for pattern in ["_bl.", "_bl_", "bill_of_lading", "/bl_"]) or item_lower.endswith("_bl"):
@@ -53,7 +59,23 @@ def get_attachment_paths(email_obj: Any) -> Tuple[Optional[str], Optional[str]]:
     return si_path, bl_path
 
 
-def process_email(email_raw: Any, data_dir: str) -> dict:
+def read_attachment_from_inbox(inbox: Inbox, rel_path: str) -> str:
+    """Reads attachments over HTTP/local inbox, handling both plain text and .xlsx spreadsheets."""
+    ext = os.path.splitext(rel_path)[1].lower()
+
+    if ext == ".xlsx":
+        raw_bytes = inbox.read_bytes(rel_path)
+        excel_data = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None)
+        output = []
+        for sheet_name, df in excel_data.items():
+            output.append(f"--- Sheet: {sheet_name} ---")
+            output.append(df.to_csv(index=False))
+        return "\n".join(output)
+    
+    return inbox.read_text(rel_path)
+
+
+def process_email(email_raw: Any, inbox: Inbox) -> dict:
     # Handle cases where the email file JSON root is a list [ {...} ]
     if isinstance(email_raw, list) and len(email_raw) > 0:
         email = email_raw[0]
@@ -89,16 +111,13 @@ def process_email(email_raw: Any, data_dir: str) -> dict:
         record["review_reason"] = "missing_attachment"
         return record
 
-    si_full_path = os.path.join(data_dir, si_rel_path)
-    bl_full_path = os.path.join(data_dir, bl_rel_path)
-
     try:
-        si_text = read_attachment(si_full_path)
-        bl_text = read_attachment(bl_full_path)
+        si_text = read_attachment_from_inbox(inbox, si_rel_path)
+        bl_text = read_attachment_from_inbox(inbox, bl_rel_path)
     except Exception as e:
         record["status"] = "NEEDS_REVIEW"
         record["review_reason"] = "unreadable"
-        print(f"  [WARN] Attachment read failure: {e}")
+        print(f"   [WARN] Attachment read failure: {e}")
         return record
 
     try:
@@ -107,7 +126,7 @@ def process_email(email_raw: Any, data_dir: str) -> dict:
     except Exception as e:
         record["status"] = "NEEDS_REVIEW"
         record["review_reason"] = "unreadable"
-        print(f"  [WARN] Extraction failure: {e}")
+        print(f"   [WARN] Extraction failure: {e}")
         return record
 
     missing = [f for f in TARGET_FIELDS if si_details.get(f) is None or bl_details.get(f) is None]
@@ -119,7 +138,6 @@ def process_email(email_raw: Any, data_dir: str) -> dict:
     if has_mismatch:
         record["has_defect"] = True
         record["defect_fields"] = list(mismatches.keys())
-        # Only set MISMATCH if we aren't already flagging for review
         if record["status"] == "OK":
             record["status"] = "MISMATCH"
 
@@ -127,61 +145,56 @@ def process_email(email_raw: Any, data_dir: str) -> dict:
 
 
 def main():
-    DATA_SOURCE = "data_averis"
+    # Docker server URL endpoint
+    DATA_SOURCE = "http://localhost:8080"
 
     try:
-        inbox = loader.Inbox(DATA_SOURCE)
+        inbox = Inbox(DATA_SOURCE)
         emails = list(inbox)
+        print(f"[INFO] Connected to Docker server at '{DATA_SOURCE}'. Total emails: {len(emails)}")
     except Exception as e:
-        print(f"[ERROR] Error loading inbox from '{DATA_SOURCE}': {e}")
+        print(f"[ERROR] Could not connect to Docker server at '{DATA_SOURCE}': {e}")
+        print("Make sure your Docker container is running on port 8080.")
         return
-
-    print(f"[INFO] Total emails loaded from '{DATA_SOURCE}': {len(emails)}")
 
     if len(emails) == 0:
-        print(f"[ERROR] No emails found! Check if the folder path '{DATA_SOURCE}' is correct.")
-        print("Expected folder structure:")
-        print("  shipping_verifier/")
-        print(f"  +-- {DATA_SOURCE}/")
-        print("      +-- inbox/          (contains .json files)")
-        print("      +-- attachments/    (contains document files)")
-        return
-
-    sample = emails[0]
-    print(f"[DEBUG] First email keys: {list(sample.keys())}")
-
-    sample_id = sample.get("email_id") or sample.get("id") or sample.get("message_id")
-    print(f"[DEBUG] First email ID: {sample_id}")
-    if sample_id is None:
-        print("[ERROR] Email ID is None! Check key name from keys list above.")
+        print("[ERROR] No emails returned from server!")
         return
 
     results = {}
     print("\nRunning end-to-end processing...")
 
-    for email in emails[:5]:
-
-
-        
-
+    # Process all emails (required for full server evaluation)
+    for i, email in enumerate(emails, start=1):
         email_id = email.get("email_id") or email.get("id") or email.get("message_id")
 
         if not email_id:
-            print("[WARN] Skipped an email with missing ID")
+            print(f"[{i}/{len(emails)}] [WARN] Skipped an email with missing ID")
             continue
 
         try:
-            results[str(email_id)] = process_email(email, DATA_SOURCE)
+            results[str(email_id)] = process_email(email, inbox)
             cat = results[str(email_id)]["category"]
             status = results[str(email_id)]["status"]
-            print(f"  OK  {email_id}  [{cat}] [{status}]")
+            print(f"[{i}/{len(emails)}] OK  {email_id}  [{cat}] [{status}]")
         except Exception as err:
-            print(f"  FAIL {email_id}: {err}")
+            print(f"[{i}/{len(emails)}] FAIL {email_id}: {err}")
 
-    # Save output formatted for self-evaluation
+    # Save local submission copy
     with open("submission.json", "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved {len(results)} results to submission.json")
+
+    # POST results to server and print evaluation scoreboard
+    if inbox.is_http:
+        print("\n[INFO] Submitting results to Docker server for evaluation...")
+        try:
+            scoreboard = inbox.submit(results)
+            print("\n================ SCOREBOARD RESULTS ================")
+            print(json.dumps(scoreboard, indent=2))
+            print("====================================================\n")
+        except Exception as e:
+            print(f"[ERROR] Evaluation submission failed: {e}")
 
 
 if __name__ == "__main__":
