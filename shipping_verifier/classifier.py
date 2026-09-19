@@ -1,87 +1,95 @@
-import time
 import os
-from typing import Dict, Any, Literal
-from pydantic import BaseModel, Field
-from openai import OpenAI
+import json
+from typing import Dict, Any
 from dotenv import load_dotenv
+from groq import Groq
 
 load_dotenv()
 
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=os.getenv("GROQ_API_KEY"),
-)
+# Initialize Groq client
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-class EmailClassification(BaseModel):
-    category: Literal[
-        "bl_comparison",
-        "si_request",
-        "invoice_query",
-        "general",
-        "spam"
-    ] = Field(description="The primary classification of the email.")
+VALID_CATEGORIES = {"bl_comparison", "si_request", "invoice_query", "general", "spam"}
+
+SYSTEM_PROMPT = """You are an expert shipping and logistics email classification engine.
+Your job is to classify the primary intent of an email into EXACTLY ONE of the following 5 categories:
+
+1. "bl_comparison": The email asks to compare, verify, check, or audit a Shipping Instruction (SI) against a draft Bill of Lading (BL) for discrepancies or defects. Usually references comparing documents or checking draft BL against SI.
+2. "si_request": The email requests issuing, drafting, submitting, or updating a Shipping Instruction (SI), or provides SI details/booking instructions.
+3. "invoice_query": The email's CORE subject/intent is asking about billing, invoices, payment status, tax invoices, or freight charges.
+   IMPORTANT CRITICAL RULE: Ignore routine payment disclaimers, billing footnotes, account details in email signatures, or standard company disclaimers. Only classify as "invoice_query" if the sender is explicitly asking about an invoice or payment.
+4. "general": General operational inquiries, vessel schedules, tracking/ETA requests, container status, or routine logistics communications that do not fall under the above.
+5. "spam": Marketing material, promotional emails, junk, or completely irrelevant topics.
+
+Respond ONLY with a JSON object in this exact schema:
+{
+  "category": "bl_comparison" | "si_request" | "invoice_query" | "general" | "spam",
+  "reasoning": "Brief 1-sentence rationale"
+}"""
+
 
 def classify_email(email: Dict[str, Any]) -> str:
-    subject = str(email.get("subject") or email.get("subject_line") or "").lower()
-    body = str(email.get("body") or email.get("text") or email.get("content") or "").lower()
-    content = f"{subject} {body}"
-    attachments = email.get("attachments", {})
-    has_attachments = bool(attachments)
-
-    # 1. Local Keyword Pre-Classifier (Bypasses API call entirely)
-    if any(k in content for k in ["casino", "lottery", "unsubscribed", "buy now", "crypto"]):
-        return "spam"
-    if any(k in content for k in ["invoice", "billing", "payment", "receipt", "remittance"]):
-        return "invoice_query"
-    if any(k in content for k in ["new si", "create si", "prepare si", "shipping instruction request"]):
-        return "si_request"
-    if has_attachments and any(k in content for k in ["compare", "draft bl", "check bl", "si vs bl", "verify", "discrepancy", "confirm", "confirm docs", "attached are the si", "bl for"]):
-        return "bl_comparison"
-
-    # 2. Groq API Fallback using allam-2-7b
-    prompt = f"""
-    Classify the following email into exactly one category.
-    Return ONLY a JSON object with a single key "category":
-    - "bl_comparison": Request to check, compare, or verify a Shipping Instruction (SI) against a Bill of Lading (BL).
-    - "si_request": Request to draft or prepare a brand new SI.
-    - "invoice_query": Billing, payment, or invoice questions.
-    - "general": Operational updates or general communications.
-    - "spam": Marketing, promotional, or unsolicited irrelevant emails.
-
-    Subject: {subject}
-    Body: {body}
-    Has attachments: {has_attachments}
     """
+    Classifies an email into one of 5 target categories:
+    - bl_comparison
+    - si_request
+    - invoice_query
+    - general
+    - spam
+    """
+    subject = str(email.get("subject") or "").strip()
+    body = str(email.get("body") or "").strip()
+    attachments = email.get("attachments") or []
 
-    max_retries = 5
-    wait_time = 2
+    # 1. Fast heuristic pre-filter for obvious SPAM
+    content_lower = f"{subject} {body}".lower()
+    if any(term in content_lower for term in ["casino", "crypto investment", "unsubscribed", "lottery"]):
+        if not any(k in content_lower for k in ["shipping", "lading", "container", "booking"]):
+            return "spam"
 
-    for attempt in range(max_retries):
-        try:
-            response = client.chat.completions.create(
-                model="allam-2-7b",
-                messages=[
-                    {"role": "system", "content": "You are a JSON-only classification assistant. Always output valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-            
-            raw_text = response.choices[0].message.content
-            if raw_text:
-                parsed = EmailClassification.model_validate_json(raw_text)
-                return parsed.category
-            return "general"
+    # Truncate body if excessively long to prevent token overflow while retaining main request context
+    body_snippet = body[:2500]
 
-        except Exception as e:
-            err_msg = str(e)
-            if any(code in err_msg for code in ["429", "500", "503", "rate_limit_exceeded"]):
-                print(f"  [WARN] Groq Classifier API transient error ({type(e).__name__}): {e}. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait_time)
-                wait_time += 3
-            else:
-                print(f"  [WARN] Classification error: {e}")
-                return "general"
+    user_prompt = f"""Subject: {subject}
+Attachments: {json.dumps(attachments)}
+
+Email Body:
+{body_snippet}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="allam-2-7b",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+
+        raw_content = response.choices[0].message.content or "{}"
+        result_json = json.loads(raw_content)
+        category = str(result_json.get("category", "")).lower().strip()
+
+        if category in VALID_CATEGORIES:
+            return category
+
+        # Fallback matching if output contains string variations
+        for valid_cat in VALID_CATEGORIES:
+            if valid_cat in category:
+                return valid_cat
+
+    except Exception as e:
+        print(f"   [WARN] LLM Classifier API error ({e}), applying fallback rules.")
+
+    # 2. Rule-based Fallbacks (In case of API timeout/error)
+    has_attachments = bool(attachments)
+    
+    if has_attachments and any(k in content_lower for k in ["compare", "discrepancy", "draft bl", "si vs bl", "check bl"]):
+        return "bl_comparison"
+    elif any(k in content_lower for k in ["shipping instruction", "submit si", "si details", "draft si", "si request"]):
+        return "si_request"
+    elif "invoice" in subject.lower() or "billing" in subject.lower() or "payment" in subject.lower():
+        return "invoice_query"
 
     return "general"
