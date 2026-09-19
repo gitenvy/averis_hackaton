@@ -129,7 +129,7 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚡ Quick Controls")
 
-    if st.button("▶️ Run Audit Pipeline", type="primary", use_container_width=True):
+    if st.button("▶️ Run Audit Pipeline", type="primary", width="stretch"):
         if not os.path.exists(MAIN_PY_PATH):
             st.error(f"Cannot find `main.py` at expected path: `{MAIN_PY_PATH}`.")
         else:
@@ -166,7 +166,7 @@ with st.sidebar:
             data=json.dumps(data_raw, indent=2),
             file_name="submission.json",
             mime="application/json",
-            use_container_width=True
+            width="stretch"
         )
 
 
@@ -249,7 +249,7 @@ with tab1:
 
     st.dataframe(
         filtered_df[["Email ID", "Category", "Status", "Review Reason", "Defect Fields", "Supervisor Notes"]],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Email ID": st.column_config.TextColumn("Email ID", width="small"),
@@ -329,7 +329,7 @@ with tab3:
             st.markdown("#### Pending Escalation Queue")
             st.dataframe(
                 review_queue[["Email ID", "Status", "Review Reason", "Defect Fields"]],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -345,7 +345,7 @@ with tab3:
             act_c1, act_c2 = st.columns(2)
             
             with act_c1:
-                if st.button("✅ Force Approve (Mark OK)", use_container_width=True, type="primary"):
+                if st.button("✅ Force Approve (Mark OK)", width="stretch", type="primary"):
                     st.session_state.hitl_decisions[target_id] = {
                         "status": "OK",
                         "notes": supervisor_notes or "Manually approved by supervisor"
@@ -354,7 +354,7 @@ with tab3:
                     st.rerun()
 
             with act_c2:
-                if st.button("🚨 Escalate to Freight Forwarder", use_container_width=True):
+                if st.button("🚨 Escalate to Freight Forwarder", width="stretch"):
                     st.session_state.hitl_decisions[target_id] = {
                         "status": "NEEDS_REVIEW",
                         "notes": supervisor_notes or "Escalated externally to forwarder"
