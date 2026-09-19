@@ -1,0 +1,5 @@
+{
+    "python.analysis.extraPaths": [
+        "./shipping_verifier/data_averis"
+    ]
+}

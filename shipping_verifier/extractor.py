@@ -1,9 +1,13 @@
 import json
 from typing import Optional
 from pydantic import BaseModel, Field
-from openai import OpenAI
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
 
-client = OpenAI()  # Assumes OPENAI_API_KEY environment variable
+load_dotenv()
+
+client = genai.Client()  # Automatically uses GEMINI_API_KEY from .env
 
 class ShipmentDetails(BaseModel):
     shipper: Optional[str] = Field(None, description="Name and address of shipper/exporter")
@@ -18,14 +22,23 @@ def extract_shipment_details(document_text: str) -> ShipmentDetails:
     prompt = f"""
     Extract shipment details from the following document.
     Normalize gross weight into kilograms (e.g. convert metric tons to kg if needed).
+    If a field is missing, unreadable, or not mentioned, set it to null.
     
     Document Text:
     {document_text}
     """
     
-    response = client.beta.chat.completions.parse(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        response_format=ShipmentDetails,
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ShipmentDetails,
+        ),
     )
-    return response.choices[0].message.parsed
+    
+    # Type guard for Pylance: Ensure response.text is not None/empty
+    if not response.text:
+        raise ValueError("Failed to extract structured shipment details: Empty response from Gemini API.")
+
+    return ShipmentDetails.model_validate_json(response.text)

@@ -1,188 +1,138 @@
 import json
-import re
-from typing import Any, Dict, List, Optional, Tuple
+import os
 from data_averis import loader
-
-# The 7 required fields to compare
-TARGET_FIELDS = [
-    "shipper",
-    "consignee",
-    "notify_party",
-    "port_of_loading",
-    "port_of_discharge",
-    "container_count",
-    "gross_weight_kg",
-]
+from classifier import classify_email
+from reader import read_attachment
+from extractor import extract_shipment_details
+from comparator import compare_shipments, TARGET_FIELDS
+from dotenv import load_dotenv
+load_dotenv()
 
 
-def classify_email(email: Dict[str, Any]) -> str:
-    """
-    Classifies email into one of:
-    - document_comparison_request
-    - new_si_request
-    - invoice_query
-    - general_message
-    - spam
-    """
-    subject = email.get("subject", "").lower()
-    body = email.get("body", "").lower()
-    content = f"{subject} {body}"
+# Category mapping to uppercase enums matching sample_submission.json
+CATEGORY_MAP = {
+    "document_comparison_request": "DOCUMENT_COMPARISON",
+    "new_si_request": "NEW_SI",
+    "invoice_query": "INVOICE",
+    "general_message": "GENERAL",
+    "spam": "SPAM",
+}
 
-    if any(k in content for k in ["casino", "lottery", "unsubscribed", "buy now"]):
-        return "spam"
-    if any(k in content for k in ["invoice", "billing", "payment", "receipt"]):
-        return "invoice_query"
-    if any(k in content for k in ["new si", "create si", "shipping instruction request"]):
-        return "new_si_request"
-    if any(k in content for k in ["compare", "draft bl", "check bl", "verify", "si vs bl"]):
-        return "document_comparison_request"
+def process_email(email: dict, data_dir: str) -> dict:
+    raw_cat = classify_email(email)
+    category = CATEGORY_MAP.get(raw_cat.lower(), raw_cat.upper())
 
-    # Fallback default
-    return "general_message"
+    record = {
+        "category": category,
+        "status": "OK",
+        "review_reason": None,
+        "defect_fields": [],
+        "has_defect": False
+    }
 
+    # Only document comparison requests proceed to attachment extraction
+    if category not in ["DOCUMENT_COMPARISON", "DOCUMENT_COMPARISON_REQUEST"]:
+        return record
 
-def parse_document_text(text: str) -> Dict[str, Any]:
-    """
-    Extracts key shipment fields from raw text using regex patterns.
-    Can be swapped or augmented with an LLM for complex/scanned formats.
-    """
-    data = {}
+    attachments = email.get("attachments", {})
+    si_rel_path = attachments.get("si")
+    bl_rel_path = attachments.get("bl")
 
-    # Extract Shipper
-    shipper_match = re.search(r"(?:Shipper|Exporter):\s*(.*)", text, re.IGNORECASE)
-    data["shipper"] = shipper_match.group(1).strip() if shipper_match else None
+    if not si_rel_path or not bl_rel_path:
+        record["status"] = "NEEDS_REVIEW"
+        record["review_reason"] = "Missing required SI or BL attachment reference."
+        return record
 
-    # Extract Consignee
-    consignee_match = re.search(r"(?:Consignee):\s*(.*)", text, re.IGNORECASE)
-    data["consignee"] = consignee_match.group(1).strip() if consignee_match else None
+    si_full_path = os.path.join(data_dir, si_rel_path)
+    bl_full_path = os.path.join(data_dir, bl_rel_path)
 
-    # Extract Notify Party
-    notify_match = re.search(r"(?:Notify Party|Notify):\s*(.*)", text, re.IGNORECASE)
-    data["notify_party"] = notify_match.group(1).strip() if notify_match else None
+    # Read attachments
+    try:
+        si_text = read_attachment(si_full_path)
+        bl_text = read_attachment(bl_full_path)
+    except Exception as e:
+        record["status"] = "NEEDS_REVIEW"
+        record["review_reason"] = f"Attachment read failure: {str(e)}"
+        return record
 
-    # Extract Port of Loading (POL)
-    pol_match = re.search(r"(?:Port of Loading|POL|Load Port):\s*(.*)", text, re.IGNORECASE)
-    data["port_of_loading"] = pol_match.group(1).strip() if pol_match else None
+    # Extract structured details via Gemini
+    try:
+        si_details = extract_shipment_details(si_text).model_dump()
+        bl_details = extract_shipment_details(bl_text).model_dump()
+    except Exception as e:
+        record["status"] = "NEEDS_REVIEW"
+        record["review_reason"] = f"Extraction failure: {str(e)}"
+        return record
 
-    # Extract Port of Discharge (POD)
-    pod_match = re.search(r"(?:Port of Discharge|POD|Discharge Port):\s*(.*)", text, re.IGNORECASE)
-    data["port_of_discharge"] = pod_match.group(1).strip() if pod_match else None
+    # Escalate if required fields couldn't be extracted reliably
+    missing = [f for f in TARGET_FIELDS if si_details.get(f) is None or bl_details.get(f) is None]
+    if missing:
+        record["status"] = "NEEDS_REVIEW"
+        record["review_reason"] = f"Uncertain or unreadable fields: {', '.join(missing)}"
 
-    # Extract Container Count
-    container_match = re.search(r"(?:Container Count|Total Containers|Containers):\s*(\d+)", text, re.IGNORECASE)
-    data["container_count"] = int(container_match.group(1)) if container_match else None
+    # Compare fields
+    has_mismatch, mismatches = compare_shipments(si_details, bl_details)
+    
+    if has_mismatch:
+        record["has_defect"] = True
+        record["defect_fields"] = list(mismatches.keys())
 
-    # Extract Gross Weight (kg)
-    weight_match = re.search(r"(?:Gross Weight|GW|Weight):\s*([\d,\.]+)\s*(?:kg|kgs)?", text, re.IGNORECASE)
-    if weight_match:
-        clean_w = weight_match.group(1).replace(",", "")
-        try:
-            data["gross_weight_kg"] = float(clean_w)
-        except ValueError:
-            data["gross_weight_kg"] = None
-    else:
-        data["gross_weight_kg"] = None
+    return record
 
-    return data
+def main():
+    DATA_SOURCE = "data_averis"  # Check if your folder is named "data" or "data_averis"
+    
+    try:
+        inbox = loader.Inbox(DATA_SOURCE)
+        emails = list(inbox)
+    except Exception as e:
+        print(f"❌ Error loading inbox from '{DATA_SOURCE}': {e}")
+        return
 
+    # --- DEBUG SECTION START ---
+    print(f"🔍 DEBUG: Total emails loaded from '{DATA_SOURCE}': {len(emails)}")
+    
+    if len(emails) == 0:
+        print(f"❌ DEBUG ALERT: No emails found! Check if the folder path '{DATA_SOURCE}' is correct.")
+        print("Expected folder structure:")
+        print("  shipping_verifier/")
+        print(f"  └── {DATA_SOURCE}/")
+        print("      ├── inbox/          (contains .json files)")
+        print("      └── attachments/    (contains document files)")
+        return
 
-def normalize_val(field: str, val: Any) -> Optional[str]:
-    """Standardizes string and numeric formats for comparison."""
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return str(val)
-    # Strip spaces and case for textual comparison
-    return re.sub(r"\s+", " ", str(val)).strip().lower()
+    sample = emails[0]
+    print(f"🔍 DEBUG: First email dictionary keys: {list(sample.keys())}")
+    
+    sample_id = sample.get("id") or sample.get("email_id") or sample.get("message_id")
+    print(f"🔍 DEBUG: First email extracted ID: {sample_id}")
+    if sample_id is None:
+        print("❌ DEBUG ALERT: Email ID is returning None! Check key name from keys list above.")
+        return
+    # --- DEBUG SECTION END ---
 
-
-def compare_documents(si_data: Dict[str, Any], bl_data: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """Compares SI and BL data across the 7 fields."""
-    mismatches = {}
-    has_mismatch = False
-
-    for field in TARGET_FIELDS:
-        si_val = si_data.get(field)
-        bl_val = bl_data.get(field)
-
-        norm_si = normalize_val(field, si_val)
-        norm_bl = normalize_val(field, bl_val)
-
-        if norm_si != norm_bl:
-            has_mismatch = True
-            mismatches[field] = {
-                "si": si_val,
-                "bl": bl_val
-            }
-
-    return has_mismatch, mismatches
-
-
-def process_inbox(data_source: str = "data") -> Dict[str, Any]:
-    """Main execution loop to process all emails and generate the submission dict."""
-    inbox = loader.Inbox(data_source)
     results = {}
+    print("\nRunning end-to-end processing...")
 
-    for email in inbox:
-        email_id = email.get("id") or email.get("email_id")
-        category = classify_email(email)
+    for email in emails:
+        email_id = email.get("id") or email.get("email_id") or email.get("message_id")
+        
+        # Guard against None key
+        if not email_id:
+            print("Warning: Skipped an email with missing ID")
+            continue
 
-        record = {
-            "category": category,
-            "has_mismatch": False,
-            "mismatches": {},
-            "needs_human_review": False,
-            "review_reason": None
-        }
+        try:
+            results[str(email_id)] = process_email(email, DATA_SOURCE)
+            print(f"  ✓ Processed email {email_id}")
+        except Exception as err:
+            print(f"  ❌ Error processing email {email_id}: {err}")
 
-        if category == "document_comparison_request":
-            si_path = email.get("attachments", {}).get("si")
-            bl_path = email.get("attachments", {}).get("bl")
-
-            if not si_path or not bl_path:
-                record["needs_human_review"] = True
-                record["review_reason"] = "Missing required SI or BL attachment."
-            else:
-                try:
-                    si_text = inbox.read_text(si_path)
-                    bl_text = inbox.read_text(bl_path)
-
-                    si_data = parse_document_text(si_text)
-                    bl_data = parse_document_text(bl_text)
-
-                    # Check for missing critical fields
-                    if any(si_data[f] is None for f in TARGET_FIELDS) or any(bl_data[f] is None for f in TARGET_FIELDS):
-                        record["needs_human_review"] = True
-                        record["review_reason"] = "Failed to parse one or more target fields reliably."
-
-                    has_mismatch, mismatches = compare_documents(si_data, bl_data)
-                    record["has_mismatch"] = has_mismatch
-                    record["mismatches"] = mismatches
-
-                except Exception as e:
-                    record["needs_human_review"] = True
-                    record["review_reason"] = f"Extraction error: {str(e)}"
-
-        results[email_id] = record
-
-    return results
+    # Save output formatted for self-evaluation
+    with open("submission.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nSaved {len(results)} results to submission.json")
 
 
 if __name__ == "__main__":
-    # Point to local folder 'data' or local server URL 'http://localhost:8080'
-    DATA_SOURCE = "data"
-    
-    print("Processing inbox...")
-    output = process_inbox(DATA_SOURCE)
-
-    # Save to JSON
-    with open("submission.json", "w") as f:
-        json.dump(output, f, indent=2)
-
-    # Self-evaluation trigger
-    inbox = loader.Inbox(DATA_SOURCE)
-    try:
-        score = inbox.submit(output)
-        print("Evaluation Scoreboard:", score)
-    except Exception as err:
-        print(f"Submission finished (Local server eval not triggered: {err})")
+    main()
