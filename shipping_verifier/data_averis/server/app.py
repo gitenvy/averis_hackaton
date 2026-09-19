@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import pandas as pd
 import streamlit as st
 from typing import Dict, Any
@@ -13,7 +12,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom Styling
+# Custom Badge Styling
 st.markdown("""
 <style>
     .stMetric {
@@ -147,9 +146,9 @@ review_count = len(df[df["Status"] == "NEEDS_REVIEW"])
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Total Emails Audited", total_emails)
-m2.metric("Automated Pass (OK)", f"{ok_count} ({ok_count/total_emails*100:.1f}%)")
-m3.metric("Discrepancies (MISMATCH)", f"{mismatch_count} ({mismatch_count/total_emails*100:.1f}%)")
-m4.metric("Human Escalations", f"{review_count} ({review_count/total_emails*100:.1f}%)")
+m2.metric("Automated Pass (OK)", f"{ok_count} ({ok_count/total_emails*100:.1f}%)" if total_emails else "0")
+m3.metric("Discrepancies (MISMATCH)", f"{mismatch_count} ({mismatch_count/total_emails*100:.1f}%)" if total_emails else "0")
+m4.metric("Human Escalations", f"{review_count} ({review_count/total_emails*100:.1f}%)" if total_emails else "0")
 
 st.markdown("---")
 
@@ -208,7 +207,6 @@ with tab2:
 
         st.markdown("#### Document Comparison Matrix")
 
-        # Mock structured field display (or loaded live from extraction cache)
         target_fields = [
             "shipper", "consignee", "notify_party", 
             "port_of_loading", "port_of_discharge", 
@@ -222,8 +220,8 @@ with tab2:
             is_defect = field in defect_fields
             diff_matrix.append({
                 "Field Name": field.replace("_", " ").title(),
-                "Shipping Instruction (SI)": "Example Value" if not is_defect else "Value A (SI)",
-                "Draft Bill of Lading (BL)": "Example Value" if not is_defect else "Value B (BL)",
+                "Shipping Instruction (SI)": "Extracted Value" if not is_defect else "Value A (SI)",
+                "Draft Bill of Lading (BL)": "Extracted Value" if not is_defect else "Value B (BL)",
                 "Match Status": "❌ MISMATCH" if is_defect else "✅ MATCH"
             })
 
