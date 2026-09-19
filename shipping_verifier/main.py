@@ -12,7 +12,7 @@ import os
 # Add the 'data_averis' folder to Python's path so loader.py can be found
 from data_averis.server.loader import Inbox
 
-from classifier import classify_email
+from classifier import  classify_email
 from extractor import  extract_shipment_details
 from comparator import compare_shipments, TARGET_FIELDS
 

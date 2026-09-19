@@ -2,12 +2,15 @@ import os
 import json
 from typing import Dict, Any, Optional, Union
 from dotenv import load_dotenv
-from groq import Groq
+from openai import OpenAI
 
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL_NAME = os.getenv("GROQ_MODEL", "allam-2-7b")
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+)
+MODEL_NAME = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
 
 EXTRACTION_SYSTEM_PROMPT = """You are an expert shipping document entity extraction engine.
 Your task is to parse raw document text or email contents and extract standard Bill of Lading (BL) / Shipping Instruction (SI) fields.
@@ -49,9 +52,6 @@ JSON Schema Output:
 
 
 def extract_document_fields(document_text: str, doc_type: str = "DOCUMENT") -> Dict[str, Optional[str]]:
-    """
-    Extracts structured logistics entities from raw document text.
-    """
     if not document_text or not document_text.strip():
         return {}
 
@@ -71,7 +71,6 @@ def extract_document_fields(document_text: str, doc_type: str = "DOCUMENT") -> D
         raw_content = response.choices[0].message.content or "{}"
         extracted_data = json.loads(raw_content)
 
-        # Clean string whitespace and normalize empty strings to None
         cleaned_fields = {}
         for key, val in extracted_data.items():
             if isinstance(val, str):
@@ -83,7 +82,7 @@ def extract_document_fields(document_text: str, doc_type: str = "DOCUMENT") -> D
         return cleaned_fields
 
     except Exception as e:
-        print(f"   [WARN] LLM Extractor API error ({e}). Returning empty extraction.")
+        print(f"   [WARN] OpenRouter Extractor API error ({e}). Returning empty extraction.")
         return {}
 
 
@@ -91,10 +90,6 @@ def extract_shipment_details(
     input_data: Union[str, Dict[str, Any]], 
     doc_type: str = "DOCUMENT"
 ) -> Dict[str, Optional[str]]:
-    """
-    Wrapper function to resolve 'extract_shipment_details' imports across main.py and comparator.py.
-    Accepts either raw string text or an email dictionary.
-    """
     if isinstance(input_data, dict):
         subject = str(input_data.get("subject") or "").strip()
         body = str(input_data.get("body") or "").strip()
