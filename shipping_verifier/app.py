@@ -1,151 +1,340 @@
 import os
-import sys
 import json
+import requests
+import pandas as pd
 import streamlit as st
+from typing import Dict, Any
 
-# 1. Path Resolution for loader.py inside data_averis/server
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(BASE_DIR, "data_averis"))
-sys.path.append(os.path.join(BASE_DIR, "data_averis", "server"))
-
-# Load Groq API Key from Streamlit Secrets or Environment
-groq_key = None
-if "GROQ_API_KEY" in st.secrets:
-    groq_key = st.secrets["GROQ_API_KEY"]
-    os.environ["GROQ_API_KEY"] = groq_key
-elif os.getenv("GROQ_API_KEY"):
-    groq_key = os.getenv("GROQ_API_KEY")
-
-# Safe Imports with Default Unbound Prevention
-Inbox = None
-try:
-    from loader import Inbox
-except ImportError:
-    try:
-        from data_averis.server.loader import Inbox
-    except ImportError:
-        Inbox = None
-
-process_email = None
-try:
-    from main import process_email
-except ImportError as e:
-    st.error(f"Error importing process_email from main.py: {e}")
-
-
-# 2. Streamlit Page Configuration
+# Page Setup
 st.set_page_config(
-    page_title="SDOC Shipping Document Auditor",
+    page_title="SDOC | AI Shipping Auditor",
     page_icon="🚢",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("🚢 SDOC Automated Shipping Document Auditor")
-st.caption("Cloud-Native AI Document Audit & Verification Engine Powered by Groq LPU Cloud & Allam-2-7B")
+# Custom Styling for Badges & Clean Layout
+st.markdown("""
+<style>
+    .stMetric {
+        background: #161b22;
+        padding: 16px;
+        border-radius: 10px;
+        border: 1px solid #30363d;
+    }
+    .badge-ok {
+        background-color: #0e4429;
+        color: #3fb950;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+    .badge-mismatch {
+        background-color: #4c1d1d;
+        color: #f85149;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+    .badge-review {
+        background-color: #4d2d00;
+        color: #d29922;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# API Key Check Banner
-if not groq_key:
-    st.warning("⚠️ GROQ_API_KEY not detected in secrets or environment. Configure it under Streamlit Cloud Advanced Settings.")
+
+# Initialize Session State for HITL Decisions
+if "hitl_decisions" not in st.session_state:
+    st.session_state.hitl_decisions = {}
+
+
+@st.cache_data
+def load_submission_data(file_path: str = "submission.json") -> Dict[str, Any]:
+    """Loads and caches submission JSON results."""
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def check_server_health(url: str) -> bool:
+    """Checks if the FastAPI/Docker evaluation server is reachable."""
+    try:
+        res = requests.get(f"{url.rstrip('/')}/health", timeout=2)
+        return res.status_code == 200
+    except Exception:
+        return False
+
+
+def render_status_pill(status: str) -> str:
+    if status == "OK":
+        return '<span class="badge-ok">✅ Passed (OK)</span>'
+    elif status == "MISMATCH":
+        return '<span class="badge-mismatch">❌ Discrepancy</span>'
+    elif status == "NEEDS_REVIEW":
+        return '<span class="badge-review">⚠️ Needs Review</span>'
+    return f'<span>{status}</span>'
+
+
+# --- SIDEBAR CONTROL PANEL ---
+with st.sidebar:
+    st.title("🚢 SDOC Auditor")
+    st.caption("AI Shipping Verification Engine v2.0")
+    st.markdown("---")
+
+    # Server Status Indicator
+    eval_url = st.text_input(
+        "Evaluation Server URL",
+        value=os.getenv("EVAL_SERVER_URL", "http://localhost:8080"),
+        help="FastAPI / Docker endpoint"
+    )
+    
+    server_online = check_server_health(eval_url)
+    if server_online:
+        st.success("🟢 Evaluation Server Connected")
+    else:
+        st.warning("🔴 Server Unreachable (Check Docker)")
+
+    st.markdown("---")
+    st.subheader("⚡ Quick Controls")
+
+    if st.button("▶️ Run Audit Pipeline", type="primary", use_container_width=True):
+        with st.status("Executing 520-email audit pipeline...", expanded=True) as status_box:
+            st.write("Fetching inbox records...")
+            st.write("Classifying intent & extracting entities...")
+            exit_code = os.system("python main.py")
+            if exit_code == 0:
+                st.cache_data.clear()
+                status_box.update(label="Audit Complete!", state="complete", expanded=False)
+                st.success("Results updated successfully!")
+                st.rerun()
+            else:
+                status_box.update(label="Pipeline Execution Failed", state="error")
+                st.error("Error executing `main.py`. Check terminal logs.")
+
+    st.markdown("---")
+    # Export Data
+    data_raw = load_submission_data()
+    if data_raw:
+        json_str = json.dumps(data_raw, indent=2)
+        st.download_button(
+            label="📥 Download submission.json",
+            data=json_str,
+            file_name="submission.json",
+            mime="application/json",
+            use_container_width=True
+        )
+
+
+# --- MAIN HEADER ---
+st.title("Automated Shipping Document Auditor")
+st.markdown("Parse logistics communications, cross-examine Shipping Instructions (SI) against Bills of Lading (BL), and escalate edge cases automatically.")
+
+# Load Submission Data
+data = load_submission_data()
+
+if not data:
+    st.info("👋 **Welcome!** No evaluation output found yet (`submission.json`). Click **▶️ Run Audit Pipeline** in the sidebar to process the inbox dataset.")
+    st.stop()
+
+# Build DataFrame with HITL Overrides Applied
+rows = []
+for eid, rec in data.items():
+    # Apply supervisor session state overrides if present
+    override = st.session_state.hitl_decisions.get(eid)
+    status = override["status"] if override else rec.get("status", "OK")
+    notes = override["notes"] if override else ""
+    
+    rows.append({
+        "Email ID": eid,
+        "Category": rec.get("category", "GENERAL"),
+        "Status": status,
+        "Review Reason": rec.get("review_reason") or "-",
+        "Defect Fields": ", ".join(rec.get("defect_fields", [])) if rec.get("defect_fields") else "None",
+        "Has Defect": rec.get("has_defect", False),
+        "Raw Defect List": rec.get("defect_fields", []),
+        "Supervisor Notes": notes
+    })
+
+df = pd.DataFrame(rows)
+total_emails = len(df)
+ok_count = len(df[df["Status"] == "OK"])
+mismatch_count = len(df[df["Status"] == "MISMATCH"])
+review_count = len(df[df["Status"] == "NEEDS_REVIEW"])
+
+# --- KPI METRIC CARDS ---
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Total Emails Audited", total_emails)
+k2.metric("Passed (OK)", f"{ok_count}", delta=f"{ok_count/total_emails*100:.1f}% Auto-cleared")
+k3.metric("Discrepancies", f"{mismatch_count}", delta=f"{mismatch_count/total_emails*100:.1f}% Mismatched", delta_color="inverse")
+k4.metric("Escalations", f"{review_count}", delta=f"{review_count/total_emails*100:.1f}% In Queue", delta_color="off")
 
 st.markdown("---")
 
-# 3. Sidebar Configuration
-st.sidebar.header("⚙️ Configuration")
-server_url = st.sidebar.text_input("Evaluation Server URL", value="http://localhost:8080")
-sample_limit = st.sidebar.slider("Sample size for batch run", min_value=1, max_value=520, value=20)
-
-st.sidebar.markdown("""
-### ☁️ Cloud Architecture
-- **Inference**: Groq Cloud LPU
-- **Model**: `Allam-2-7B`
-- **Frontend**: Streamlit Cloud
-- **Pipeline**: Decoupled Python REST Service
-""")
+# --- WORKSPACE TABS ---
+tab1, tab2, tab3 = st.tabs([
+    "📊 Audit Summary & Logs", 
+    "🔍 Document Diff Inspector", 
+    "🚨 Supervisor Escalation Portal"
+])
 
 
-# 4. Main UI Tabs
-tab1, tab2 = st.tabs(["🚀 Server Audit Runner", "📄 Single File Inspection"])
-
+# ==========================================
+# TAB 1: AUDIT SUMMARY & LOGS
+# ==========================================
 with tab1:
-    st.subheader("Batch Evaluation Runner")
-    st.write("Run the cloud AI pipeline against the evaluation server inbox.")
+    st.subheader("Interactive Audit Log")
 
-    if st.button("▶️ Run Pipeline Audit", type="primary"):
-        if not Inbox:
-            st.error("Could not load `Inbox` class. Please check your repository folder structure.")
-        elif not process_email:
-            st.error("Could not load `process_email` function from `main.py`.")
-        else:
-            with st.spinner("Connecting to server & running Groq LPU Cloud extraction..."):
-                try:
-                    inbox = Inbox(server_url)
-                    emails = list(inbox)[:sample_limit]
-                    
-                    results = {}
-                    progress_bar = st.progress(0)
-                    
-                    for i, email in enumerate(emails):
-                        eid = email.get("email_id") or email.get("id") or f"email_{i+1:03d}"
-                        results[str(eid)] = process_email(email, inbox)
-                        progress_bar.progress((i + 1) / len(emails))
+    # Filter Controls Bar
+    f_col1, f_col2, f_col3 = st.columns([2, 1, 1])
+    with f_col1:
+        search_query = st.text_input("🔍 Quick Search (Email ID, Field Name, Category)", "")
+    with f_col2:
+        category_filter = st.multiselect("Category", options=df["Category"].unique(), default=df["Category"].unique())
+    with f_col3:
+        status_filter = st.multiselect("Status", options=df["Status"].unique(), default=df["Status"].unique())
 
-                    st.success(f"Successfully processed {len(results)} emails!")
+    # Apply Filters
+    filtered_df = df[
+        (df["Category"].isin(category_filter)) & 
+        (df["Status"].isin(status_filter))
+    ]
 
-                    # Summary Metrics Dashboard
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    categories = [r["category"] for r in results.values()]
-                    bl_comp = sum(1 for c in categories if c == "BL_COMPARISON")
-                    mismatches = sum(1 for r in results.values() if r.get("status") == "MISMATCH")
-                    needs_review = sum(1 for r in results.values() if r.get("status") == "NEEDS_REVIEW")
+    if search_query:
+        sq = search_query.lower()
+        filtered_df = filtered_df[
+            filtered_df["Email ID"].str.lower().str.contains(sq) |
+            filtered_df["Category"].str.lower().str.contains(sq) |
+            filtered_df["Defect Fields"].str.lower().str.contains(sq)
+        ]
 
-                    col1.metric("Total Evaluated", len(results))
-                    col2.metric("BL Comparisons", bl_comp)
-                    col3.metric("Defects / Mismatches", mismatches)
-                    col4.metric("Needs Review", needs_review)
+    st.markdown(f"Displaying **{len(filtered_df)}** of **{total_emails}** records")
 
-                    st.subheader("Submission Payload Output (`submission.json`)")
-                    st.json(results)
+    st.dataframe(
+        filtered_df[["Email ID", "Category", "Status", "Review Reason", "Defect Fields", "Supervisor Notes"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Email ID": st.column_config.TextColumn("Email ID", width="small"),
+            "Category": st.column_config.TextColumn("Category", width="medium"),
+            "Status": st.column_config.TextColumn("Audit Result", width="medium"),
+            "Review Reason": st.column_config.TextColumn("Reason for Review", width="medium"),
+            "Defect Fields": st.column_config.TextColumn("Flagged Discrepancies", width="large"),
+            "Supervisor Notes": st.column_config.TextColumn("HITL Notes", width="medium"),
+        }
+    )
 
-                except Exception as e:
-                    st.error(f"Execution error: {e}")
-                    st.info("Note: When deployed publicly on Streamlit Cloud, localhost endpoints (http://localhost:8080) must be replaced with a public server URL or tested using Tab 2.")
 
+# ==========================================
+# TAB 2: DOCUMENT DIFF INSPECTOR
+# ==========================================
 with tab2:
-    st.subheader("Manual Email JSON Upload & Inspection")
-    st.write("Upload a raw email JSON object to inspect the classification and discrepancy detection live.")
-    
-    uploaded_file = st.file_uploader("Upload email JSON file", type=["json"])
-    
-    if uploaded_file is not None:
-        try:
-            email_data = json.load(uploaded_file)
-            
-            col_a, col_b = st.columns(2)
-            
-            with col_a:
-                st.subheader("Input Email Payload")
-                st.json(email_data)
+    st.subheader("Field-Level Discrepancy Matrix")
 
-            with col_b:
-                st.subheader("AI Pipeline Result")
-                if st.button("Run Audit on Uploaded Email"):
-                    if not process_email:
-                        st.error("`process_email` could not be loaded from `main.py`.")
-                    elif not Inbox:
-                        st.error("`Inbox` class could not be loaded from `loader.py`.")
-                    else:
-                        with st.spinner("Analyzing document with Allam-2-7B..."):
-                            inbox_instance = Inbox(server_url)
-                            result = process_email(email_data, inbox_instance)
-                            st.json(result)
-                            
-                            if result.get("status") == "MISMATCH":
-                                st.error(f"Mismatches Found: {result.get('defect_fields')}")
-                            elif result.get("status") == "NEEDS_REVIEW":
-                                st.warning(f"Escalated to Human Review: {result.get('review_reason')}")
-                            else:
-                                st.success("All fields match specifications!")
+    # Filter selector to target interesting items quickly
+    inspect_type = st.radio("Show Email Records:", ["Mismatches & Escalations Only", "All Records"], horizontal=True)
+    
+    if inspect_type == "Mismatches & Escalations Only":
+        selectable_ids = df[df["Status"].isin(["MISMATCH", "NEEDS_REVIEW"])]["Email ID"].tolist()
+    else:
+        selectable_ids = df["Email ID"].tolist()
 
-        except Exception as e:
-            st.error(f"Error parsing uploaded file: {e}")
+    if not selectable_ids:
+        st.success("No discrepancy records found for inspection!")
+    else:
+        selected_id = st.selectbox("Select Email Record to Cross-Examine", options=selectable_ids)
+
+        if selected_id:
+            record_row = df[df["Email ID"] == selected_id].iloc[0]
+            
+            # Header info
+            ic1, ic2, ic3 = st.columns(3)
+            ic1.markdown(f"**Selected Email:** `{selected_id}`")
+            ic2.markdown(f"**Intent Category:** `{record_row['Category']}`")
+            ic3.markdown(f"**Current Status:** {render_status_pill(record_row['Status'])}", unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            target_fields = [
+                "shipper", "consignee", "notify_party", 
+                "port_of_loading", "port_of_discharge", 
+                "container_count", "gross_weight_kg"
+            ]
+
+            defect_list = record_row["Raw Defect List"]
+
+            # Dynamic Diff Table
+            diff_data = []
+            for field in target_fields:
+                is_mismatch = field in defect_list
+                diff_data.append({
+                    "Canonical Field": field.replace("_", " ").title(),
+                    "Field Key": f"`{field}`",
+                    "Audit Result": "❌ Mismatch Detected" if is_mismatch else "✅ Match",
+                    "Action Needed": "Requires Operator Check" if is_mismatch else "Verified"
+                })
+
+            st.table(pd.DataFrame(diff_data))
+
+
+# ==========================================
+# TAB 3: HUMAN-IN-THE-LOOP (HITL) PORTAL
+# ==========================================
+with tab3:
+    st.subheader("Supervisor Decision Portal")
+    st.caption("Review flagged escalations, apply manual audit overrides, and log notes.")
+
+    review_queue = df[df["Status"].isin(["NEEDS_REVIEW", "MISMATCH"])]
+
+    if review_queue.empty:
+        st.balloons()
+        st.success("🎉 All documents have passed automated audit cleanly! Zero items in human escalation queue.")
+    else:
+        q_col1, q_col2 = st.columns([1, 1])
+
+        with q_col1:
+            st.markdown("#### Pending Escalation Queue")
+            st.dataframe(
+                review_queue[["Email ID", "Status", "Review Reason", "Defect Fields"]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        with q_col2:
+            st.markdown("#### Action Console")
+            target_id = st.selectbox("Select Record to Resolve", options=review_queue["Email ID"].tolist())
+            
+            curr_rec = review_queue[review_queue["Email ID"] == target_id].iloc[0]
+            st.info(f"**Reason Flagged:** `{curr_rec['Review Reason']}` | **Defects:** `{curr_rec['Defect Fields']}`")
+
+            supervisor_notes = st.text_area("Audit Notes / Resolution Justification", placeholder="e.g. Verified with carrier via phone. Discrepancy approved.")
+
+            act_c1, act_c2 = st.columns(2)
+            
+            with act_c1:
+                if st.button("✅ Force Approve (Mark OK)", use_container_width=True, type="primary"):
+                    st.session_state.hitl_decisions[target_id] = {
+                        "status": "OK",
+                        "notes": supervisor_notes or "Manually approved by supervisor"
+                    }
+                    st.success(f"Record `{target_id}` updated to OK!")
+                    st.rerun()
+
+            with act_c2:
+                if st.button("🚨 Escalate to Freight Forwarder", use_container_width=True):
+                    st.session_state.hitl_decisions[target_id] = {
+                        "status": "NEEDS_REVIEW",
+                        "notes": supervisor_notes or "Escalated externally to forwarder"
+                    }
+                    st.warning(f"Escalation ticket generated for `{target_id}`.")
+                    st.rerun()
