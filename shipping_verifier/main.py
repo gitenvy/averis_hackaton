@@ -5,7 +5,6 @@ import io
 import sys
 import time
 from typing import Any, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -163,34 +162,15 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
     return record
 
 
-def process_email_with_retry(email: Any, inbox: Inbox, max_retries: int = 3) -> dict:
-    """Wraps process_email with exponential backoff to handle 429 Rate Limits."""
-    for attempt in range(max_retries):
-        try:
-            return process_email(email, inbox)
-        except Exception as e:
-            err_msg = str(e).lower()
-            if "429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg:
-                backoff_time = (2 ** attempt) + 1.5
-                print(f"[WARN] Rate limit hit. Retrying in {backoff_time:.1f}s (Attempt {attempt + 1}/{max_retries})...")
-                time.sleep(backoff_time)
-            else:
-                raise e
-    return process_email(email, inbox)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=0, help="Limit number of emails to process")
-    parser.add_argument("--workers", type=int, default=2, help="Parallel workers")
     args, _ = parser.parse_known_args()
 
     limit = args.limit or int(os.getenv("BATCH_LIMIT", 0))
-    max_workers = args.workers or int(os.getenv("MAX_WORKERS", 2))
 
     DATA_SOURCE = os.getenv("EVAL_SERVER_URL", "http://localhost:8080")
     
-    # Initialize variables cleanly to prevent UnboundLocalError
     emails = []
     inbox = None
 
@@ -207,7 +187,6 @@ def main():
 
     # 2. Fallback to offline folder if server failed or wasn't used
     if not emails or inbox is None:
-        # Check both subfolder and root repository paths
         possible_local_paths = [
             os.path.join(BASE_DIR, "offline_inbox"),
             os.path.join(os.path.dirname(BASE_DIR), "offline_inbox"),
@@ -235,33 +214,29 @@ def main():
 
     if limit > 0:
         emails = emails[:limit]
-        print(f"[INFO] Processing EXACTLY {len(emails)} email(s).")
+        print(f"[INFO] Processing EXACTLY {len(emails)} email(s) sequentially.")
 
     results = {}
-    print(f"\nRunning parallel processing ({max_workers} thread workers)...")
+    print("\nRunning sequential processing...")
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_email = {
-            executor.submit(process_email_with_retry, email, inbox): email 
-            for email in emails
-        }
-        
-        for i, future in enumerate(as_completed(future_to_email), start=1):
-            email = future_to_email[future]
-            email_id = str(email.get("email_id") or email.get("id") or email.get("message_id") or "")
-            
-            if not email_id:
-                print(f"[{i}/{len(emails)}] [WARN] Skipped email with missing ID")
-                continue
+    for i, email in enumerate(emails, start=1):
+        email_id = str(email.get("email_id") or email.get("id") or email.get("message_id") or "")
 
-            try:
-                res = future.result()
-                results[email_id] = res
-                cat = res["category"]
-                status = res["status"]
-                print(f"[{i}/{len(emails)}] OK  {email_id}  [{cat}] [{status}]")
-            except Exception as err:
-                print(f"[{i}/{len(emails)}] FAIL {email_id}: {err}")
+        if not email_id:
+            print(f"[{i}/{len(emails)}] [WARN] Skipped email with missing ID")
+            continue
+
+        try:
+            res = process_email(email, inbox)
+            results[email_id] = res
+            cat = res["category"]
+            status = res["status"]
+            print(f"[{i}/{len(emails)}] OK  {email_id}  [{cat}] [{status}]")
+        except Exception as err:
+            print(f"[{i}/{len(emails)}] FAIL {email_id}: {err}")
+
+        # Short pause between calls to respect free API rate limits
+        time.sleep(0.3)
 
     submission_path = os.path.join(BASE_DIR, "submission.json")
     with open(submission_path, "w", encoding="utf-8") as f:
@@ -277,6 +252,7 @@ def main():
             print("====================================================\n")
         except Exception as e:
             print(f"[ERROR] Evaluation submission failed: {e}")
+
 
 if __name__ == "__main__":
     main()
