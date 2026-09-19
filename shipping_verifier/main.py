@@ -1,24 +1,25 @@
 import json
 import os
 import io
+import sys
 from typing import Any, Optional, Tuple
 import pandas as pd
 from dotenv import load_dotenv
 
-# Flexible import depending on your project folder structure
-import sys
-import os
+# Add 'data_averis' to path for loader import
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(BASE_DIR)
+sys.path.append(os.path.join(BASE_DIR, "data_averis"))
+sys.path.append(os.path.join(BASE_DIR, "data_averis", "server"))
 
-# Add the 'data_averis' folder to Python's path so loader.py can be found
 from data_averis.server.loader import Inbox
-
-from classifier import  classify_email
-from extractor import  extract_shipment_details
+from classifier import classify_email
+from extractor import extract_shipment_details
 from comparator import compare_shipments, TARGET_FIELDS
 
 load_dotenv()
 
-# Category mapping — aligns internal classifier labels with the spec's enum values
+# Category mapping — aligns internal classifier labels with spec enum values
 CATEGORY_MAP = {
     "bl_comparison": "BL_COMPARISON",
     "si_request":    "SI_REQUEST",
@@ -91,7 +92,7 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
         }
 
     raw_cat = classify_email(email)
-    category = CATEGORY_MAP.get(raw_cat.lower(), "GENERAL")
+    category = CATEGORY_MAP.get(raw_cat.lower(), raw_cat.upper())
 
     record = {
         "category": category,
@@ -101,16 +102,18 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
         "has_defect": False
     }
 
+    # Non-comparison emails stop here
     if category != "BL_COMPARISON":
         return record
 
+    # 1. Check for missing attachments
     si_rel_path, bl_rel_path = get_attachment_paths(email)
-
     if not si_rel_path or not bl_rel_path:
         record["status"] = "NEEDS_REVIEW"
         record["review_reason"] = "missing_attachment"
         return record
 
+    # 2. Read attachment files
     try:
         si_text = read_attachment_from_inbox(inbox, si_rel_path)
         bl_text = read_attachment_from_inbox(inbox, bl_rel_path)
@@ -119,17 +122,47 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
         record["review_reason"] = "unreadable"
         print(f"   [WARN] Attachment read failure: {e}")
         return record
-    
+
+    # Unreadable check if content is empty or corrupt
+    if not si_text or not bl_text or len(si_text.strip()) < 10 or len(bl_text.strip()) < 10:
+        record["status"] = "NEEDS_REVIEW"
+        record["review_reason"] = "unreadable"
+        return record
+
+    # 3. Check for wrong_doc_type (e.g. attached file is an invoice or packing list)
+    combined_docs = f"{si_text} {bl_text}".lower()
+    if any(k in combined_docs for k in ["tax invoice", "commercial invoice", "packing list", "purchase order"]):
+        if not any(k in combined_docs for k in ["bill of lading", "shipping instruction", "consignee", "port of loading"]):
+            record["status"] = "NEEDS_REVIEW"
+            record["review_reason"] = "wrong_doc_type"
+            return record
+
+    # 4. Extract entities from SI and BL
     try:
-        si_details = extract_shipment_details(si_text)
-        bl_details = extract_shipment_details(bl_text)
+        si_details = extract_shipment_details(si_text, doc_type="SI")
+        bl_details = extract_shipment_details(bl_text, doc_type="BL")
     except Exception as e:
         record["status"] = "NEEDS_REVIEW"
         record["review_reason"] = "unreadable"
         print(f"   [WARN] Extraction failure: {e}")
         return record
 
-    has_mismatch, mismatches = compare_shipments(si_details, bl_details)
+    # Safely handle dictionary conversion if required
+   # ✅ REPLACE WITH THIS:
+    si_dict = si_details
+    bl_dict = bl_details
+
+    # 5. Check for missing required target fields
+    missing_fields = [
+        f for f in TARGET_FIELDS 
+        if si_dict.get(f) is None or bl_dict.get(f) is None
+    ]
+    if missing_fields:
+        record["status"] = "NEEDS_REVIEW"
+        record["review_reason"] = "missing_value"
+
+    # 6. Compare extracted SI vs draft BL
+    has_mismatch, mismatches = compare_shipments(si_dict, bl_dict)
     if has_mismatch:
         record["has_defect"] = True
         record["defect_fields"] = list(mismatches.keys())
@@ -140,8 +173,7 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
 
 
 def main():
-    # Docker server URL endpoint
-    DATA_SOURCE = "http://localhost:8080"
+    DATA_SOURCE = os.getenv("EVAL_SERVER_URL", "http://localhost:8080")
 
     try:
         inbox = Inbox(DATA_SOURCE)
@@ -159,7 +191,6 @@ def main():
     results = {}
     print("\nRunning end-to-end processing...")
 
-    # Process all emails (required for full server evaluation)
     for i, email in enumerate(emails, start=1):
         email_id = email.get("email_id") or email.get("id") or email.get("message_id")
 
@@ -175,8 +206,8 @@ def main():
         except Exception as err:
             print(f"[{i}/{len(emails)}] FAIL {email_id}: {err}")
 
-    # Save local submission copy
-    with open("submission.json", "w") as f:
+    # Save local submission file
+    with open("submission.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved {len(results)} results to submission.json")
 
