@@ -1,28 +1,19 @@
 import os
-import pdfplumber
-import docx
+import pandas as pd
 
 def read_attachment(file_path: str) -> str:
     if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Attachment not found: {file_path}")
+        raise FileNotFoundError(f"Attachment file not found: {file_path}")
 
     ext = os.path.splitext(file_path)[1].lower()
 
-    if ext in [".txt", ""]:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
+    if ext == ".xlsx":
+        excel_data = pd.read_excel(file_path, sheet_name=None)
+        output = []
+        for sheet_name, df in excel_data.items():
+            output.append(f"--- Sheet: {sheet_name} ---")
+            output.append(df.to_csv(index=False))
+        return "\n".join(output)
 
-    elif ext == ".pdf":
-        text = ""
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                extracted = page.extract_text()
-                if extracted:
-                    text += extracted + "\n"
-        return text
-
-    elif ext in [".docx", ".doc"]:
-        doc = docx.Document(file_path)
-        return "\n".join([p.text for p in doc.paragraphs if p.text])
-
-    raise ValueError(f"Unsupported file format: {ext}")
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()

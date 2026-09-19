@@ -1,26 +1,75 @@
 import json
 import os
+from typing import Any, Optional, Tuple
 from data_averis import loader
 from classifier import classify_email
 from reader import read_attachment
-from extractor import extract_shipment_details
+from extractor import  extract_shipment_details
 from comparator import compare_shipments, TARGET_FIELDS
 from dotenv import load_dotenv
 load_dotenv()
 
 
-# Category mapping to uppercase enums matching sample_submission.json
+
+# Category mapping — aligns internal classifier labels with the spec's enum values
 CATEGORY_MAP = {
-    "document_comparison_request": "DOCUMENT_COMPARISON",
-    "new_si_request": "NEW_SI",
-    "invoice_query": "INVOICE",
-    "general_message": "GENERAL",
-    "spam": "SPAM",
+    "bl_comparison": "BL_COMPARISON",
+    "si_request":    "SI_REQUEST",
+    "invoice_query": "INVOICE_QUERY",
+    "general":       "GENERAL",
+    "spam":          "SPAM",
 }
 
-def process_email(email: dict, data_dir: str) -> dict:
+
+def get_attachment_paths(email_obj: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Safely parses attachment paths regardless of list or dict wrappers."""
+    if not isinstance(email_obj, dict):
+        return None, None
+
+    attachments = email_obj.get("attachments")
+    si_path, bl_path = None, None
+
+    if isinstance(attachments, dict):
+        si_path = attachments.get("si") or attachments.get("shipping_instruction")
+        bl_path = attachments.get("bl") or attachments.get("bill_of_lading")
+
+    elif isinstance(attachments, list):
+        for item in attachments:
+            if isinstance(item, dict):
+                role = str(item.get("role") or item.get("type") or item.get("name") or "").lower()
+                path = item.get("path") or item.get("filename") or item.get("file")
+                if any(k in role for k in ["si", "shipping"]):
+                    si_path = path
+                elif any(k in role for k in ["bl", "lading"]):
+                    bl_path = path
+            elif isinstance(item, str):
+                item_lower = item.lower()
+                # Matches _si., _si_v1., si_doc, shipping_instruction, or ending with _si
+                if any(pattern in item_lower for pattern in ["_si.", "_si_", "shipping_instruction", "/si_"]) or item_lower.endswith("_si"):
+                    si_path = item
+                elif any(pattern in item_lower for pattern in ["_bl.", "_bl_", "bill_of_lading", "/bl_"]) or item_lower.endswith("_bl"):
+                    bl_path = item
+
+    return si_path, bl_path
+
+
+def process_email(email_raw: Any, data_dir: str) -> dict:
+    # Handle cases where the email file JSON root is a list [ {...} ]
+    if isinstance(email_raw, list) and len(email_raw) > 0:
+        email = email_raw[0]
+    elif isinstance(email_raw, dict):
+        email = email_raw
+    else:
+        return {
+            "category": "GENERAL",
+            "status": "OK",
+            "review_reason": None,
+            "defect_fields": [],
+            "has_defect": False
+        }
+
     raw_cat = classify_email(email)
-    category = CATEGORY_MAP.get(raw_cat.lower(), raw_cat.upper())
+    category = CATEGORY_MAP.get(raw_cat.lower(), "GENERAL")
 
     record = {
         "category": category,
@@ -30,103 +79,104 @@ def process_email(email: dict, data_dir: str) -> dict:
         "has_defect": False
     }
 
-    # Only document comparison requests proceed to attachment extraction
-    if category not in ["DOCUMENT_COMPARISON", "DOCUMENT_COMPARISON_REQUEST"]:
+    if category != "BL_COMPARISON":
         return record
 
-    attachments = email.get("attachments", {})
-    si_rel_path = attachments.get("si")
-    bl_rel_path = attachments.get("bl")
+    si_rel_path, bl_rel_path = get_attachment_paths(email)
 
     if not si_rel_path or not bl_rel_path:
         record["status"] = "NEEDS_REVIEW"
-        record["review_reason"] = "Missing required SI or BL attachment reference."
+        record["review_reason"] = "missing_attachment"
         return record
 
     si_full_path = os.path.join(data_dir, si_rel_path)
     bl_full_path = os.path.join(data_dir, bl_rel_path)
 
-    # Read attachments
     try:
         si_text = read_attachment(si_full_path)
         bl_text = read_attachment(bl_full_path)
     except Exception as e:
         record["status"] = "NEEDS_REVIEW"
-        record["review_reason"] = f"Attachment read failure: {str(e)}"
+        record["review_reason"] = "unreadable"
+        print(f"  [WARN] Attachment read failure: {e}")
         return record
 
-    # Extract structured details via Gemini
     try:
         si_details = extract_shipment_details(si_text).model_dump()
         bl_details = extract_shipment_details(bl_text).model_dump()
     except Exception as e:
         record["status"] = "NEEDS_REVIEW"
-        record["review_reason"] = f"Extraction failure: {str(e)}"
+        record["review_reason"] = "unreadable"
+        print(f"  [WARN] Extraction failure: {e}")
         return record
 
-    # Escalate if required fields couldn't be extracted reliably
     missing = [f for f in TARGET_FIELDS if si_details.get(f) is None or bl_details.get(f) is None]
     if missing:
         record["status"] = "NEEDS_REVIEW"
-        record["review_reason"] = f"Uncertain or unreadable fields: {', '.join(missing)}"
+        record["review_reason"] = "missing_value"
 
-    # Compare fields
     has_mismatch, mismatches = compare_shipments(si_details, bl_details)
-    
     if has_mismatch:
         record["has_defect"] = True
         record["defect_fields"] = list(mismatches.keys())
+        # Only set MISMATCH if we aren't already flagging for review
+        if record["status"] == "OK":
+            record["status"] = "MISMATCH"
 
     return record
 
+
 def main():
-    DATA_SOURCE = "data_averis"  # Check if your folder is named "data" or "data_averis"
-    
+    DATA_SOURCE = "data_averis"
+
     try:
         inbox = loader.Inbox(DATA_SOURCE)
         emails = list(inbox)
     except Exception as e:
-        print(f"❌ Error loading inbox from '{DATA_SOURCE}': {e}")
+        print(f"[ERROR] Error loading inbox from '{DATA_SOURCE}': {e}")
         return
 
-    # --- DEBUG SECTION START ---
-    print(f"🔍 DEBUG: Total emails loaded from '{DATA_SOURCE}': {len(emails)}")
-    
+    print(f"[INFO] Total emails loaded from '{DATA_SOURCE}': {len(emails)}")
+
     if len(emails) == 0:
-        print(f"❌ DEBUG ALERT: No emails found! Check if the folder path '{DATA_SOURCE}' is correct.")
+        print(f"[ERROR] No emails found! Check if the folder path '{DATA_SOURCE}' is correct.")
         print("Expected folder structure:")
         print("  shipping_verifier/")
-        print(f"  └── {DATA_SOURCE}/")
-        print("      ├── inbox/          (contains .json files)")
-        print("      └── attachments/    (contains document files)")
+        print(f"  +-- {DATA_SOURCE}/")
+        print("      +-- inbox/          (contains .json files)")
+        print("      +-- attachments/    (contains document files)")
         return
 
     sample = emails[0]
-    print(f"🔍 DEBUG: First email dictionary keys: {list(sample.keys())}")
-    
-    sample_id = sample.get("id") or sample.get("email_id") or sample.get("message_id")
-    print(f"🔍 DEBUG: First email extracted ID: {sample_id}")
+    print(f"[DEBUG] First email keys: {list(sample.keys())}")
+
+    sample_id = sample.get("email_id") or sample.get("id") or sample.get("message_id")
+    print(f"[DEBUG] First email ID: {sample_id}")
     if sample_id is None:
-        print("❌ DEBUG ALERT: Email ID is returning None! Check key name from keys list above.")
+        print("[ERROR] Email ID is None! Check key name from keys list above.")
         return
-    # --- DEBUG SECTION END ---
 
     results = {}
     print("\nRunning end-to-end processing...")
 
-    for email in emails:
-        email_id = email.get("id") or email.get("email_id") or email.get("message_id")
+    for email in emails[:5]:
+
+
         
-        # Guard against None key
+
+        email_id = email.get("email_id") or email.get("id") or email.get("message_id")
+
         if not email_id:
-            print("Warning: Skipped an email with missing ID")
+            print("[WARN] Skipped an email with missing ID")
             continue
 
         try:
             results[str(email_id)] = process_email(email, DATA_SOURCE)
-            print(f"  ✓ Processed email {email_id}")
+            cat = results[str(email_id)]["category"]
+            status = results[str(email_id)]["status"]
+            print(f"  OK  {email_id}  [{cat}] [{status}]")
         except Exception as err:
-            print(f"  ❌ Error processing email {email_id}: {err}")
+            print(f"  FAIL {email_id}: {err}")
 
     # Save output formatted for self-evaluation
     with open("submission.json", "w") as f:
