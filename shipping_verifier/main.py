@@ -4,6 +4,7 @@ import os
 import io
 import sys
 import time
+import zipfile
 from typing import Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
@@ -164,15 +165,15 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
 
 
 def process_email_with_retry(email: Any, inbox: Inbox, max_retries: int = 3) -> dict:
-    """Wraps process_email with exponential backoff to handle 429 Rate Limits on free-tier keys."""
+    """Wraps process_email with exponential backoff to handle 429 Rate Limits."""
     for attempt in range(max_retries):
         try:
             return process_email(email, inbox)
         except Exception as e:
             err_msg = str(e).lower()
             if "429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg:
-                backoff_time = (2 ** attempt) + 1.5  # 2.5s, 5.5s, 9.5s
-                print(f"[WARN] Free-tier rate limit (429) hit. Retrying in {backoff_time:.1f}s (Attempt {attempt + 1}/{max_retries})...")
+                backoff_time = (2 ** attempt) + 1.5
+                print(f"[WARN] Rate limit hit. Retrying in {backoff_time:.1f}s (Attempt {attempt + 1}/{max_retries})...")
                 time.sleep(backoff_time)
             else:
                 raise e
@@ -182,33 +183,62 @@ def process_email_with_retry(email: Any, inbox: Inbox, max_retries: int = 3) -> 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=0, help="Limit number of emails to process")
-    parser.add_argument("--workers", type=int, default=2, help="Parallel workers (Set to 2 for free tier keys)")
+    parser.add_argument("--workers", type=int, default=2, help="Parallel workers")
     args, _ = parser.parse_known_args()
 
     limit = args.limit or int(os.getenv("BATCH_LIMIT", 0))
-    # Default to 2 workers for free tier rate limit safety
     max_workers = args.workers or int(os.getenv("MAX_WORKERS", 2))
 
     DATA_SOURCE = os.getenv("EVAL_SERVER_URL", "http://localhost:8080")
+    
+    # Offline paths
+    zip_file = os.path.join(BASE_DIR, "offline_inbox.zip")
+    offline_dir = os.path.join(BASE_DIR, "offline_inbox")
+    fallback_data_dir = os.path.join(BASE_DIR, "data_averis")
 
-    try:
-        inbox = Inbox(DATA_SOURCE)
-        emails = list(inbox)
-        print(f"[INFO] Connected to Docker server at '{DATA_SOURCE}'. Total available emails: {len(emails)}")
-    except Exception as e:
-        print(f"[ERROR] Could not connect to Docker server at '{DATA_SOURCE}': {e}")
-        return
+    # Auto-extract offline_inbox.zip if unextracted
+    if not os.path.exists(offline_dir) and os.path.exists(zip_file):
+        print(f"[INFO] Unpacking '{zip_file}'...")
+        try:
+            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+                zip_ref.extractall(BASE_DIR)
+            print("[INFO] Extraction complete!")
+        except Exception as e:
+            print(f"[ERROR] Failed to extract {zip_file}: {e}")
+
+    inbox = None
+
+    # 1. Try Docker evaluation server
+    if DATA_SOURCE.startswith("http"):
+        try:
+            inbox = Inbox(DATA_SOURCE)
+            emails = list(inbox)
+            print(f"[INFO] Connected to Docker server at '{DATA_SOURCE}'. Total emails: {len(emails)}")
+        except Exception as e:
+            print(f"[WARN] Could not reach Docker server at '{DATA_SOURCE}': {e}")
+            print("[INFO] Falling back to offline dataset...")
+
+    # 2. Fallback to offline dataset directory
+    if inbox is None or not DATA_SOURCE.startswith("http"):
+        target_local_path = offline_dir if os.path.exists(offline_dir) else fallback_data_dir
+        try:
+            inbox = Inbox(target_local_path)
+            emails = list(inbox)
+            print(f"[INFO] Plug-and-Play Mode: Loaded {len(emails)} emails from '{target_local_path}'.")
+        except Exception as e:
+            print(f"[ERROR] Could not load offline inbox dataset: {e}")
+            return
 
     if not emails:
-        print("[ERROR] No emails returned from server!")
+        print("[ERROR] No emails found in dataset!")
         return
 
     if limit > 0:
         emails = emails[:limit]
-        print(f"[INFO] Hard limit active: Processing EXACTLY {len(emails)} email(s).")
+        print(f"[INFO] Processing EXACTLY {len(emails)} email(s).")
 
     results = {}
-    print(f"\nRunning processing with {max_workers} worker threads (Free-Tier Optimized)...")
+    print(f"\nRunning parallel processing ({max_workers} thread workers)...")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_email = {
