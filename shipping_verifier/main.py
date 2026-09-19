@@ -13,7 +13,7 @@ import os
 from data_averis.server.loader import Inbox
 
 from classifier import classify_email
-from extractor import extract_shipment_details
+from extractor import  extract_shipment_details
 from comparator import compare_shipments, TARGET_FIELDS
 
 load_dotenv()
@@ -119,20 +119,15 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
         record["review_reason"] = "unreadable"
         print(f"   [WARN] Attachment read failure: {e}")
         return record
-
+    
     try:
-        si_details = extract_shipment_details(si_text).model_dump()
-        bl_details = extract_shipment_details(bl_text).model_dump()
+        si_details = extract_shipment_details(si_text)
+        bl_details = extract_shipment_details(bl_text)
     except Exception as e:
         record["status"] = "NEEDS_REVIEW"
         record["review_reason"] = "unreadable"
         print(f"   [WARN] Extraction failure: {e}")
         return record
-
-    missing = [f for f in TARGET_FIELDS if si_details.get(f) is None or bl_details.get(f) is None]
-    if missing:
-        record["status"] = "NEEDS_REVIEW"
-        record["review_reason"] = "missing_value"
 
     has_mismatch, mismatches = compare_shipments(si_details, bl_details)
     if has_mismatch:

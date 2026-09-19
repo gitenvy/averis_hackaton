@@ -6,19 +6,20 @@ from groq import Groq
 
 load_dotenv()
 
-# Initialize Groq client
+# Initialize Groq client and dynamic model selection
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+MODEL_NAME = os.getenv("GROQ_MODEL", "allam-2-7b")
 
 VALID_CATEGORIES = {"bl_comparison", "si_request", "invoice_query", "general", "spam"}
 
 SYSTEM_PROMPT = """You are an expert shipping and logistics email classification engine.
 Your job is to classify the primary intent of an email into EXACTLY ONE of the following 5 categories:
 
-1. "bl_comparison": The email asks to compare, verify, check, or audit a Shipping Instruction (SI) against a draft Bill of Lading (BL) for discrepancies or defects. Usually references comparing documents or checking draft BL against SI.
+1. "bl_comparison": The email asks to compare, verify, check, or audit a Shipping Instruction (SI) against a draft Bill of Lading (BL) for discrepancies or defects.
 2. "si_request": The email requests issuing, drafting, submitting, or updating a Shipping Instruction (SI), or provides SI details/booking instructions.
 3. "invoice_query": The email's CORE subject/intent is asking about billing, invoices, payment status, tax invoices, or freight charges.
-   IMPORTANT CRITICAL RULE: Ignore routine payment disclaimers, billing footnotes, account details in email signatures, or standard company disclaimers. Only classify as "invoice_query" if the sender is explicitly asking about an invoice or payment.
-4. "general": General operational inquiries, vessel schedules, tracking/ETA requests, container status, or routine logistics communications that do not fall under the above.
+   CRITICAL RULE: Ignore routine payment disclaimers, billing footnotes, account details in email signatures, or standard company disclaimers. Only classify as "invoice_query" if the sender is explicitly asking about an invoice or payment.
+4. "general": General operational inquiries, vessel schedules, tracking/ETA requests, container status, or routine logistics communications.
 5. "spam": Marketing material, promotional emails, junk, or completely irrelevant topics.
 
 Respond ONLY with a JSON object in this exact schema:
@@ -31,23 +32,18 @@ Respond ONLY with a JSON object in this exact schema:
 def classify_email(email: Dict[str, Any]) -> str:
     """
     Classifies an email into one of 5 target categories:
-    - bl_comparison
-    - si_request
-    - invoice_query
-    - general
-    - spam
+    Returns uppercase category: BL_COMPARISON, SI_REQUEST, INVOICE_QUERY, GENERAL, SPAM
     """
     subject = str(email.get("subject") or "").strip()
     body = str(email.get("body") or "").strip()
     attachments = email.get("attachments") or []
 
-    # 1. Fast heuristic pre-filter for obvious SPAM
+    # Fast heuristic pre-filter for obvious SPAM
     content_lower = f"{subject} {body}".lower()
     if any(term in content_lower for term in ["casino", "crypto investment", "unsubscribed", "lottery"]):
         if not any(k in content_lower for k in ["shipping", "lading", "container", "booking"]):
-            return "spam"
+            return "SPAM"
 
-    # Truncate body if excessively long to prevent token overflow while retaining main request context
     body_snippet = body[:2500]
 
     user_prompt = f"""Subject: {subject}
@@ -58,7 +54,7 @@ Email Body:
 
     try:
         response = client.chat.completions.create(
-            model="allam-2-7b",
+            model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
@@ -67,29 +63,29 @@ Email Body:
             temperature=0.0,
         )
 
+        # Type-safe content parsing for Pylance
         raw_content = response.choices[0].message.content or "{}"
         result_json = json.loads(raw_content)
         category = str(result_json.get("category", "")).lower().strip()
 
         if category in VALID_CATEGORIES:
-            return category
+            return category.upper()
 
-        # Fallback matching if output contains string variations
         for valid_cat in VALID_CATEGORIES:
             if valid_cat in category:
-                return valid_cat
+                return valid_cat.upper()
 
     except Exception as e:
         print(f"   [WARN] LLM Classifier API error ({e}), applying fallback rules.")
 
-    # 2. Rule-based Fallbacks (In case of API timeout/error)
+    # Rule-based Fallbacks in case of API timeout
     has_attachments = bool(attachments)
     
     if has_attachments and any(k in content_lower for k in ["compare", "discrepancy", "draft bl", "si vs bl", "check bl"]):
-        return "bl_comparison"
+        return "BL_COMPARISON"
     elif any(k in content_lower for k in ["shipping instruction", "submit si", "si details", "draft si", "si request"]):
-        return "si_request"
+        return "SI_REQUEST"
     elif "invoice" in subject.lower() or "billing" in subject.lower() or "payment" in subject.lower():
-        return "invoice_query"
+        return "INVOICE_QUERY"
 
-    return "general"
+    return "GENERAL"

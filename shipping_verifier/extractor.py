@@ -1,117 +1,104 @@
-import time
 import os
-import re
-from typing import Optional, Any
-from pydantic import BaseModel, Field, field_validator
-from openai import OpenAI
+import json
+from typing import Dict, Any, Optional, Union
 from dotenv import load_dotenv
+from groq import Groq
 
 load_dotenv()
 
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=os.getenv("GROQ_API_KEY"),
-)
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+MODEL_NAME = os.getenv("GROQ_MODEL", "allam-2-7b")
 
-class ShipmentDetails(BaseModel):
-    shipper: Optional[str] = Field(None, description="Name and address of shipper/exporter")
-    consignee: Optional[str] = Field(None, description="Name and address of consignee")
-    notify_party: Optional[str] = Field(None, description="Notify party details")
-    port_of_loading: Optional[str] = Field(None, description="Port of loading/POL")
-    port_of_discharge: Optional[str] = Field(None, description="Port of discharge/POD")
-    container_count: Optional[int] = Field(None, description="Total number of containers")
-    gross_weight_kg: Optional[float] = Field(None, description="Gross weight in kilograms (numeric only)")
+EXTRACTION_SYSTEM_PROMPT = """You are an expert shipping document entity extraction engine.
+Your task is to parse raw document text or email contents and extract standard Bill of Lading (BL) / Shipping Instruction (SI) fields.
 
-    @field_validator("shipper", "consignee", "notify_party", "port_of_loading", "port_of_discharge", mode="before")
-    @classmethod
-    def flatten_to_string(cls, v: Any) -> Optional[str]:
-        if isinstance(v, dict):
-            parts = [str(val).strip() for val in v.values() if val is not None and str(val).strip()]
-            return " ".join(parts) if parts else None
-        if isinstance(v, list):
-            parts = [str(val).strip() for val in v if val is not None and str(val).strip()]
-            return " ".join(parts) if parts else None
-        return str(v) if v is not None else None
+Extract the following fields accurately:
+- shipper: Full company name/address of the shipper/exporter.
+- consignee: Full company name/address of the consignee/receiver.
+- notify_party: Party to be notified upon arrival.
+- vessel: Name of the cargo vessel.
+- voyage: Voyage or flight number.
+- port_of_loading: Port where goods are loaded (POL).
+- port_of_discharge: Port where goods are delivered (POD).
+- container_number: Container ID(s) (e.g., MSCU1234567).
+- seal_number: Container seal ID.
+- cargo_description: Description of goods/cargo.
+- gross_weight: Total weight string including unit (e.g., "12500 KGS").
+- measurement: Volume/CBM string (e.g., "32.5 CBM").
 
-    @field_validator("container_count", mode="before")
-    @classmethod
-    def parse_container_count(cls, v: Any) -> Optional[int]:
-        if v is None or v == "":
-            return None
-        if isinstance(v, int):
-            return v
-        # Extract the first integer count from strings like "6 x 40'HC" or "1 x 20FT"
-        match = re.search(r'\d+', str(v))
-        if match:
-            return int(match.group())
-        return None
+Rules:
+1. Normalize missing or unknown fields to null.
+2. Maintain clean, standardized key names.
+3. Return ONLY a valid JSON object.
 
-    @field_validator("gross_weight_kg", mode="before")
-    @classmethod
-    def parse_gross_weight(cls, v: Any) -> Optional[float]:
-        if v is None or v == "":
-            return None
-        if isinstance(v, (int, float)):
-            return float(v)
-        
-        s = str(v).upper().replace(",", "").strip()
-        is_mt = "MT" in s or "TON" in s
-        
-        match = re.search(r'\d+(?:\.\d+)?', s)
-        if match:
-            val = float(match.group())
-            # Convert Metric Tons to KG if indicated
-            if is_mt and val < 1000:
-                val *= 1000.0
-            return val
-        return None
+JSON Schema Output:
+{
+  "shipper": string | null,
+  "consignee": string | null,
+  "notify_party": string | null,
+  "vessel": string | null,
+  "voyage": string | null,
+  "port_of_loading": string | null,
+  "port_of_discharge": string | null,
+  "container_number": string | null,
+  "seal_number": string | null,
+  "cargo_description": string | null,
+  "gross_weight": string | null,
+  "measurement": string | null
+}"""
 
-def extract_shipment_details(document_text: str) -> ShipmentDetails:
-    prompt = f"""
-    Extract shipment details from the following document.
-    Normalize gross weight into kilograms (e.g. convert metric tons to kg if needed).
-    IMPORTANT: 
-    - container_count MUST be a single integer (e.g., 1, 6).
-    - All text fields MUST be flat strings, NOT nested objects or dictionaries.
-    If a field is missing, unreadable, or not mentioned, set it to null.
 
-    Document Text:
-    {document_text}
+def extract_document_fields(document_text: str, doc_type: str = "DOCUMENT") -> Dict[str, Optional[str]]:
     """
+    Extracts structured logistics entities from raw document text.
+    """
+    if not document_text or not document_text.strip():
+        return {}
 
-    max_retries = 5
-    wait_time = 2
-    last_exception: Optional[Exception] = None
+    user_prompt = f"Document Type: {doc_type}\n\nDocument Text Content:\n{document_text[:4000]}"
 
-    for attempt in range(max_retries):
-        try:
-            response = client.chat.completions.create(
-                model="allam-2-7b",
-                messages=[
-                    {"role": "system", "content": "You are a JSON-only extraction bot. Return strictly valid JSON adhering to the provided schema."},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-            
-            raw_text = response.choices[0].message.content
-            if not raw_text:
-                raise ValueError("Empty response from Groq API.")
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
 
-            return ShipmentDetails.model_validate_json(raw_text)
+        raw_content = response.choices[0].message.content or "{}"
+        extracted_data = json.loads(raw_content)
 
-        except Exception as e:
-            last_exception = e
-            err_msg = str(e)
-            if any(code in err_msg for code in ["429", "500", "503", "rate_limit_exceeded"]):
-                print(f"  [WARN] Groq Extractor API transient error ({type(e).__name__}): {e}. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait_time)
-                wait_time += 3
+        # Clean string whitespace and normalize empty strings to None
+        cleaned_fields = {}
+        for key, val in extracted_data.items():
+            if isinstance(val, str):
+                val_clean = val.strip()
+                cleaned_fields[key] = val_clean if val_clean and val_clean.lower() != "null" else None
             else:
-                print(f"  [ERROR] Extractor hit exception: {e}")
-                raise e
+                cleaned_fields[key] = val
 
-    if last_exception:
-        raise last_exception
-    raise RuntimeError("Failed to extract details after maximum retries.")
+        return cleaned_fields
+
+    except Exception as e:
+        print(f"   [WARN] LLM Extractor API error ({e}). Returning empty extraction.")
+        return {}
+
+
+def extract_shipment_details(
+    input_data: Union[str, Dict[str, Any]], 
+    doc_type: str = "DOCUMENT"
+) -> Dict[str, Optional[str]]:
+    """
+    Wrapper function to resolve 'extract_shipment_details' imports across main.py and comparator.py.
+    Accepts either raw string text or an email dictionary.
+    """
+    if isinstance(input_data, dict):
+        subject = str(input_data.get("subject") or "").strip()
+        body = str(input_data.get("body") or "").strip()
+        combined_text = f"Subject: {subject}\n\nBody:\n{body}"
+        return extract_document_fields(combined_text, doc_type=doc_type)
+
+    return extract_document_fields(str(input_data or ""), doc_type=doc_type)
