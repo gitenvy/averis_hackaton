@@ -190,31 +190,43 @@ def main():
 
     DATA_SOURCE = os.getenv("EVAL_SERVER_URL", "http://localhost:8080")
     
-    # Local folder fallbacks
-    offline_dir = os.path.join(BASE_DIR, "offline_inbox")
-    fallback_data_dir = os.path.join(BASE_DIR, "data_averis")
-
+    # Initialize variables cleanly to prevent UnboundLocalError
+    emails = []
     inbox = None
 
     # 1. Try Docker evaluation server
     if DATA_SOURCE.startswith("http"):
         try:
-            inbox = Inbox(DATA_SOURCE)
-            emails = list(inbox)
+            temp_inbox = Inbox(DATA_SOURCE)
+            emails = list(temp_inbox)
+            inbox = temp_inbox
             print(f"[INFO] Connected to Docker server at '{DATA_SOURCE}'. Total emails: {len(emails)}")
         except Exception as e:
-            print(f"[WARN] Could not reach Docker server at '{DATA_SOURCE}': {e}")
+            print(f"[WARN] Could not fetch from Docker server at '{DATA_SOURCE}': {e}")
             print("[INFO] Falling back to local offline folder...")
 
-    # 2. Fallback to offline_inbox folder (or data_averis)
-    if inbox is None or not DATA_SOURCE.startswith("http"):
-        target_local_path = offline_dir if os.path.exists(offline_dir) else fallback_data_dir
-        try:
-            inbox = Inbox(target_local_path)
-            emails = list(inbox)
-            print(f"[INFO] Plug-and-Play Mode: Loaded {len(emails)} emails from '{target_local_path}'.")
-        except Exception as e:
-            print(f"[ERROR] Could not load offline inbox dataset from '{target_local_path}': {e}")
+    # 2. Fallback to offline folder if server failed or wasn't used
+    if not emails or inbox is None:
+        # Check both subfolder and root repository paths
+        possible_local_paths = [
+            os.path.join(BASE_DIR, "offline_inbox"),
+            os.path.join(os.path.dirname(BASE_DIR), "offline_inbox"),
+            os.path.join(BASE_DIR, "data_averis"),
+            os.path.join(os.path.dirname(BASE_DIR), "data_averis"),
+        ]
+
+        target_local_path = next((p for p in possible_local_paths if os.path.exists(p)), None)
+
+        if target_local_path:
+            try:
+                inbox = Inbox(target_local_path)
+                emails = list(inbox)
+                print(f"[INFO] Plug-and-Play Mode: Loaded {len(emails)} emails from '{target_local_path}'.")
+            except Exception as e:
+                print(f"[ERROR] Could not load local dataset from '{target_local_path}': {e}")
+                return
+        else:
+            print("[ERROR] Neither Docker server nor local offline_inbox/data_averis folders could be found!")
             return
 
     if not emails:
@@ -256,7 +268,7 @@ def main():
         json.dump(results, f, indent=2)
     print(f"\nSaved {len(results)} results to submission.json")
 
-    if inbox.is_http:
+    if inbox and getattr(inbox, "is_http", False):
         print("\n[INFO] Submitting batch results to Docker server for evaluation...")
         try:
             scoreboard = inbox.submit(results)
@@ -265,7 +277,6 @@ def main():
             print("====================================================\n")
         except Exception as e:
             print(f"[ERROR] Evaluation submission failed: {e}")
-
 
 if __name__ == "__main__":
     main()
