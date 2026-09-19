@@ -1,5 +1,7 @@
 import os
+import sys
 import json
+import subprocess
 import requests
 import pandas as pd
 import streamlit as st
@@ -13,7 +15,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom Styling for Badges & Clean Layout
+# Resolve directories dynamically relative to this script's location
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MAIN_PY_PATH = os.path.join(BASE_DIR, "main.py")
+SUBMISSION_JSON_PATH = os.path.join(BASE_DIR, "submission.json")
+
+# Custom Styling
 st.markdown("""
 <style>
     .stMetric {
@@ -49,14 +56,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-
-# Initialize Session State for HITL Decisions
 if "hitl_decisions" not in st.session_state:
     st.session_state.hitl_decisions = {}
 
 
 @st.cache_data
-def load_submission_data(file_path: str = "submission.json") -> Dict[str, Any]:
+def load_submission_data(file_path: str = SUBMISSION_JSON_PATH) -> Dict[str, Any]:
     """Loads and caches submission JSON results."""
     if os.path.exists(file_path):
         try:
@@ -92,7 +97,6 @@ with st.sidebar:
     st.caption("AI Shipping Verification Engine v2.0")
     st.markdown("---")
 
-    # Server Status Indicator
     eval_url = st.text_input(
         "Evaluation Server URL",
         value=os.getenv("EVAL_SERVER_URL", "http://localhost:8080"),
@@ -103,33 +107,46 @@ with st.sidebar:
     if server_online:
         st.success("🟢 Evaluation Server Connected")
     else:
-        st.warning("🔴 Server Unreachable (Check Docker)")
+        st.warning("🔴 Server Unreachable (Check Tunnel/Docker)")
 
     st.markdown("---")
     st.subheader("⚡ Quick Controls")
 
     if st.button("▶️ Run Audit Pipeline", type="primary", use_container_width=True):
-        with st.status("Executing 520-email audit pipeline...", expanded=True) as status_box:
-            st.write("Fetching inbox records...")
-            st.write("Classifying intent & extracting entities...")
-            exit_code = os.system("python main.py")
-            if exit_code == 0:
-                st.cache_data.clear()
-                status_box.update(label="Audit Complete!", state="complete", expanded=False)
-                st.success("Results updated successfully!")
-                st.rerun()
-            else:
-                status_box.update(label="Pipeline Execution Failed", state="error")
-                st.error("Error executing `main.py`. Check terminal logs.")
+        if not os.path.exists(MAIN_PY_PATH):
+            st.error(f"Cannot find `main.py` at expected path: `{MAIN_PY_PATH}`. Ensure `main.py` is committed to GitHub in the same directory as `app.py`.")
+        else:
+            with st.status("Executing audit pipeline...", expanded=True) as status_box:
+                st.write("Fetching inbox records...")
+                st.write("Classifying intent & extracting entities...")
+                
+                # Execute main.py using the exact Python executable in Streamlit Cloud's runtime environment
+                env = os.environ.copy()
+                env["EVAL_SERVER_URL"] = eval_url
+                
+                result = subprocess.run(
+                    [sys.executable, MAIN_PY_PATH],
+                    cwd=BASE_DIR,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                
+                if result.returncode == 0:
+                    st.cache_data.clear()
+                    status_box.update(label="Audit Complete!", state="complete", expanded=False)
+                    st.success("Results updated successfully!")
+                    st.rerun()
+                else:
+                    status_box.update(label="Pipeline Execution Failed", state="error")
+                    st.error(f"Error executing `main.py`:\n\n```text\n{result.stderr or result.stdout}\n```")
 
     st.markdown("---")
-    # Export Data
     data_raw = load_submission_data()
     if data_raw:
-        json_str = json.dumps(data_raw, indent=2)
         st.download_button(
             label="📥 Download submission.json",
-            data=json_str,
+            data=json.dumps(data_raw, indent=2),
             file_name="submission.json",
             mime="application/json",
             use_container_width=True
@@ -140,17 +157,15 @@ with st.sidebar:
 st.title("Automated Shipping Document Auditor")
 st.markdown("Parse logistics communications, cross-examine Shipping Instructions (SI) against Bills of Lading (BL), and escalate edge cases automatically.")
 
-# Load Submission Data
 data = load_submission_data()
 
 if not data:
     st.info("👋 **Welcome!** No evaluation output found yet (`submission.json`). Click **▶️ Run Audit Pipeline** in the sidebar to process the inbox dataset.")
     st.stop()
 
-# Build DataFrame with HITL Overrides Applied
+# Build DataFrame
 rows = []
 for eid, rec in data.items():
-    # Apply supervisor session state overrides if present
     override = st.session_state.hitl_decisions.get(eid)
     status = override["status"] if override else rec.get("status", "OK")
     notes = override["notes"] if override else ""
@@ -175,9 +190,9 @@ review_count = len(df[df["Status"] == "NEEDS_REVIEW"])
 # --- KPI METRIC CARDS ---
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Total Emails Audited", total_emails)
-k2.metric("Passed (OK)", f"{ok_count}", delta=f"{ok_count/total_emails*100:.1f}% Auto-cleared")
-k3.metric("Discrepancies", f"{mismatch_count}", delta=f"{mismatch_count/total_emails*100:.1f}% Mismatched", delta_color="inverse")
-k4.metric("Escalations", f"{review_count}", delta=f"{review_count/total_emails*100:.1f}% In Queue", delta_color="off")
+k2.metric("Passed (OK)", f"{ok_count}", delta=f"{ok_count/total_emails*100:.1f}% Auto-cleared" if total_emails else "0%")
+k3.metric("Discrepancies", f"{mismatch_count}", delta=f"{mismatch_count/total_emails*100:.1f}% Mismatched" if total_emails else "0%", delta_color="inverse")
+k4.metric("Escalations", f"{review_count}", delta=f"{review_count/total_emails*100:.1f}% In Queue" if total_emails else "0%", delta_color="off")
 
 st.markdown("---")
 
@@ -188,14 +203,10 @@ tab1, tab2, tab3 = st.tabs([
     "🚨 Supervisor Escalation Portal"
 ])
 
-
-# ==========================================
 # TAB 1: AUDIT SUMMARY & LOGS
-# ==========================================
 with tab1:
     st.subheader("Interactive Audit Log")
 
-    # Filter Controls Bar
     f_col1, f_col2, f_col3 = st.columns([2, 1, 1])
     with f_col1:
         search_query = st.text_input("🔍 Quick Search (Email ID, Field Name, Category)", "")
@@ -204,11 +215,7 @@ with tab1:
     with f_col3:
         status_filter = st.multiselect("Status", options=df["Status"].unique(), default=df["Status"].unique())
 
-    # Apply Filters
-    filtered_df = df[
-        (df["Category"].isin(category_filter)) & 
-        (df["Status"].isin(status_filter))
-    ]
+    filtered_df = df[(df["Category"].isin(category_filter)) & (df["Status"].isin(status_filter))]
 
     if search_query:
         sq = search_query.lower()
@@ -234,14 +241,10 @@ with tab1:
         }
     )
 
-
-# ==========================================
 # TAB 2: DOCUMENT DIFF INSPECTOR
-# ==========================================
 with tab2:
     st.subheader("Field-Level Discrepancy Matrix")
 
-    # Filter selector to target interesting items quickly
     inspect_type = st.radio("Show Email Records:", ["Mismatches & Escalations Only", "All Records"], horizontal=True)
     
     if inspect_type == "Mismatches & Escalations Only":
@@ -257,7 +260,6 @@ with tab2:
         if selected_id:
             record_row = df[df["Email ID"] == selected_id].iloc[0]
             
-            # Header info
             ic1, ic2, ic3 = st.columns(3)
             ic1.markdown(f"**Selected Email:** `{selected_id}`")
             ic2.markdown(f"**Intent Category:** `{record_row['Category']}`")
@@ -273,7 +275,6 @@ with tab2:
 
             defect_list = record_row["Raw Defect List"]
 
-            # Dynamic Diff Table
             diff_data = []
             for field in target_fields:
                 is_mismatch = field in defect_list
@@ -286,10 +287,7 @@ with tab2:
 
             st.table(pd.DataFrame(diff_data))
 
-
-# ==========================================
-# TAB 3: HUMAN-IN-THE-LOOP (HITL) PORTAL
-# ==========================================
+# TAB 3: HUMAN-IN-THE-LOOP PORTAL
 with tab3:
     st.subheader("Supervisor Decision Portal")
     st.caption("Review flagged escalations, apply manual audit overrides, and log notes.")
