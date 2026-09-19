@@ -16,7 +16,8 @@ if "GROQ_API_KEY" in st.secrets:
 elif os.getenv("GROQ_API_KEY"):
     groq_key = os.getenv("GROQ_API_KEY")
 
-# Safe Imports
+# Safe Imports with Default Unbound Prevention
+Inbox = None
 try:
     from loader import Inbox
 except ImportError:
@@ -25,6 +26,7 @@ except ImportError:
     except ImportError:
         Inbox = None
 
+process_email = None
 try:
     from main import process_email
 except ImportError as e:
@@ -71,6 +73,8 @@ with tab1:
     if st.button("▶️ Run Pipeline Audit", type="primary"):
         if not Inbox:
             st.error("Could not load `Inbox` class. Please check your repository folder structure.")
+        elif not process_email:
+            st.error("Could not load `process_email` function from `main.py`.")
         else:
             with st.spinner("Connecting to server & running Groq LPU Cloud extraction..."):
                 try:
@@ -126,17 +130,22 @@ with tab2:
             with col_b:
                 st.subheader("AI Pipeline Result")
                 if st.button("Run Audit on Uploaded Email"):
-                    with st.spinner("Analyzing document with Allam-2-7B..."):
-                        inbox_instance = Inbox(server_url) if Inbox else None
-                        result = process_email(email_data, inbox_instance)
-                        st.json(result)
-                        
-                        if result.get("status") == "MISMATCH":
-                            st.error(f"Mismatches Found: {result.get('defect_fields')}")
-                        elif result.get("status") == "NEEDS_REVIEW":
-                            st.warning(f"Escalated to Human Review: {result.get('review_reason')}")
-                        else:
-                            st.success("All fields match specifications!")
+                    if not process_email:
+                        st.error("`process_email` could not be loaded from `main.py`.")
+                    elif not Inbox:
+                        st.error("`Inbox` class could not be loaded from `loader.py`.")
+                    else:
+                        with st.spinner("Analyzing document with Allam-2-7B..."):
+                            inbox_instance = Inbox(server_url)
+                            result = process_email(email_data, inbox_instance)
+                            st.json(result)
+                            
+                            if result.get("status") == "MISMATCH":
+                                st.error(f"Mismatches Found: {result.get('defect_fields')}")
+                            elif result.get("status") == "NEEDS_REVIEW":
+                                st.warning(f"Escalated to Human Review: {result.get('review_reason')}")
+                            else:
+                                st.success("All fields match specifications!")
 
         except Exception as e:
             st.error(f"Error parsing uploaded file: {e}")
