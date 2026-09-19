@@ -1,5 +1,3 @@
-Deployement: https://averishackaton-zimjh2yrypszehvbpvhyn3.streamlit.app/
-
 # 🚢 SDOC - Automated Shipping Document Auditor
 
 An enterprise-grade, AI-powered document verification pipeline and audit engine built for the **SDOC Hackathon**. 
@@ -27,19 +25,32 @@ The solution is architected around a decoupled **3-Tier Cloud Architecture** uti
                                           ▼
 ┌─────────────────────────────────────────┴─────────────────────────────────────────┐
 │                               Cloud AI Inference Layer                            │
-│                       Groq Cloud LPU Allam-2-7B Acceleration                      │
+│                 Groq LPU Acceleration (Dynamic Model Selection)                   │
 └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                           │
                                           ▼
                   ┌───────────────────────────────────────────────┐
                   │            Docker Evaluation Server           │
-                  │         (FastAPI Service on port 8080)        │
-                  └───────────────────────────────────────────────┘
+                  │   (FastAPI Service on port 8080 or Tunnel)    │
+                  └───────────────────────┴───────────────────────┘
 ```
 
-1. **Cloud AI Inference Layer**: Powered by **Groq Cloud LPU Infrastructure** running `Allam-2-7B` for ultra-low latency (~300ms) semantic email classification and multi-modal document entity extraction.
+1. **Cloud AI Inference Layer**: Powered by **Groq Cloud LPU Infrastructure** for ultra-low latency (~300ms) semantic email classification and multi-modal document entity extraction.
 2. **Cloud Application Layer**: Deployed serverless via **Streamlit Cloud** for live batch auditing, manual JSON document inspection, and real-time operational metrics.
 3. **Containerized Evaluation Engine**: Local/Cloud REST microservice hosting private evaluation dataset endpoints (`POST /submit`).
+
+---
+
+## 🤖 Groq Model Configuration
+
+The application dynamically selects the Groq LLM model via environment variables (`GROQ_MODEL`), allowing instant model swapping without code changes.
+
+| Model ID | Recommended Use Case | Latency |
+| :--- | :--- | :--- |
+| `llama-3.3-70b-versatile` | **Default / Production.** Best precision for complex entity extraction & edge cases. | ~500ms |
+| `allam-2-7b` | Specialized for Arabic & multilingual logistics text. | ~200ms |
+| `llama-3.1-8b-instant` | High-speed classification for high-throughput batching. | ~100ms |
+| `mixtral-8x7b-32768` | Long-context handling for dense, multi-page attached spreadsheets. | ~400ms |
 
 ---
 
@@ -54,7 +65,7 @@ shipping_verifier/
 ├── comparator.py           # Field mismatch comparison engine
 ├── reader.py               # Attachment parser (Text & Excel .xlsx handling)
 ├── requirements.txt        # Python dependency manifest
-├── .env                    # Environment key storage (Gitignored)
+├── .env                    # Environment key & model storage (Gitignored)
 └── data_averis/
     └── server/
         ├── app.py          # FastAPI evaluation server
@@ -70,6 +81,7 @@ shipping_verifier/
 ### Prerequisites
 * **Python 3.10+** installed
 * **Docker Desktop** installed and running
+* **Node.js / npx** installed (required for port forwarding to Streamlit Cloud)
 * A **Groq API Key** ([Obtain key from Groq Console](https://console.groq.com/))
 
 ### 1. Clone & Set Up Virtual Environment
@@ -98,6 +110,7 @@ Create a `.env` file in the root `shipping_verifier/` directory:
 
 ```env
 GROQ_API_KEY=gsk_your_actual_groq_api_key_here
+GROQ_MODEL=llama-3.3-70b-versatile
 ```
 
 ---
@@ -129,9 +142,9 @@ This will:
 
 ---
 
-## 🖥️ Running the Dashboard UI
+## 🖥️ Dashboard UI & Streamlit Deployment
 
-### Option A: Local Execution
+### Option A: Local Dashboard
 Run the Streamlit application locally to test both batch auditing and single-file manual JSON inspection:
 
 ```bash
@@ -139,14 +152,34 @@ streamlit run app.py
 ```
 Access the web dashboard at `http://localhost:8501`.
 
-### Option B: Streamlit Cloud Deployment
+---
+
+### Option B: Streamlit Cloud Deployment & Port Forwarding
+
+#### 1. Push to GitHub & Deploy
 1. Push this repository to GitHub.
 2. Log into [share.streamlit.io](https://share.streamlit.io/).
 3. Connect your repository and set `app.py` as the main entry point.
-4. Under **Advanced Settings -> Secrets**, add your Groq key using valid TOML format:
+4. Under **Advanced Settings -> Secrets**, configure your keys in TOML format:
    ```toml
    GROQ_API_KEY = "gsk_your_actual_groq_api_key_here"
+   GROQ_MODEL = "llama-3.3-70b-versatile"
    ```
+
+#### 2. Connect Streamlit Cloud to Local Docker Server via Localtunnel (`npx`)
+Because Streamlit Cloud runs on a public server, it cannot reach `http://localhost:8080` on your machine directly. To run public batch audits against your local Docker evaluation server, expose port `8080`:
+
+1. Keep your Docker server running on port `8080` (`docker compose up`).
+2. Open a new terminal and run Localtunnel via `npx`:
+   ```powershell
+   # Bypass execution restriction in Windows PowerShell if required:
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+   # Launch public port forwarding tunnel for port 8080:
+   npx localtunnel --port 8080
+   ```
+3. Copy the generated public URL (e.g., `https://neat-lions-jump.loca.lt`).
+4. Paste the public URL into the **Evaluation Server URL** text box in the Streamlit Cloud sidebar and click **▶️ Run Pipeline Audit**.
 
 ---
 
@@ -175,14 +208,14 @@ $$\text{Final Score} = 0.30 \times \text{Stage1\_MacroF1} + 0.20 \times \text{St
 
 ### Fast-Track Commands
 ```powershell
-# Bypasses script execution blocking in Windows PowerShell if needed
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-
 # Re-run pipeline locally
 python main.py
+
+# Expose Docker server port to external/cloud services
+npx localtunnel --port 8080
 ```
 
 ### Common Pitfalls
-1. **Missing `.env` File**: Ensure `.env` is created locally in the root directory containing `GROQ_API_KEY`.
-2. **Docker Connection Error**: Verify Docker Desktop is open and running `docker compose up` inside `data_averis`.
-3. **Streamlit Localhost Misalignment**: When accessing the app via public Streamlit Cloud URLs, use **Tab 2 (Single File Inspection)** or expose port `8080` using a tunnel (`npx localtunnel --port 8080`).
+1. **Missing `.env` File**: Ensure `.env` is created locally in the root directory containing `GROQ_API_KEY` and `GROQ_MODEL`.
+2. **Docker Connection Error**: Verify Docker Desktop is active and running `docker compose up` inside `data_averis`.
+3. **Streamlit Cloud Localhost Error**: Do not use `http://localhost:8080` inside the public Streamlit Cloud interface. Use **Tab 2 (Single File Inspection)** or set up `npx localtunnel --port 8080` to pass the public URL.
