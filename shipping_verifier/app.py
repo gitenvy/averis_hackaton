@@ -13,9 +13,9 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-# 1. Page Configuration (MUST be the first Streamlit command)
+# 1. Page Configuration (MUST be first)
 st.set_page_config(
-    page_title="SDOC | AI Shipping Auditor",
+    page_title="AI Shipping Auditor",
     page_icon="🚢",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -25,6 +25,22 @@ st.set_page_config(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAIN_PY_PATH = os.path.join(BASE_DIR, "main.py")
 SUBMISSION_JSON_PATH = os.path.join(BASE_DIR, "submission.json")
+
+
+def get_secret(key_name: str, default: str = "") -> str:
+    """
+    Plug-and-play secret resolver hierarchy:
+    1. Streamlit Cloud Secrets (st.secrets)
+    2. OS Environment (.env or system env)
+    3. Default value fallback
+    """
+    try:
+        if hasattr(st, "secrets") and key_name in st.secrets:
+            return str(st.secrets[key_name])
+    except Exception:
+        pass
+    return os.getenv(key_name, default)
+
 
 # 3. CSS Styling
 st.markdown("""
@@ -97,17 +113,30 @@ def render_status_pill(status: str) -> str:
     return f'<span>{status}</span>'
 
 
-# SIDEBAR
+# ==========================================
+# SIDEBAR CONTROL PANEL
+# ==========================================
 with st.sidebar:
-    st.title("🚢 SDOC Auditor")
-    st.caption("AI Shipping Verification Engine v2.0")
+    st.title("🚢 Shipping Auditor")
+    st.caption("AI Document Verification Engine v2.0")
     st.markdown("---")
 
     st.subheader("⚙️ Configuration")
     
+    # Secret Fetching
+    default_api_key = get_secret("OPENROUTER_API_KEY", "")
+    default_eval_url = get_secret("EVAL_SERVER_URL", "http://localhost:8080")
+
+    openrouter_key = st.text_input(
+        "OpenRouter API Key",
+        value=default_api_key,
+        type="password",
+        help="Pre-loaded automatically from Secrets/Env if present, or enter manually."
+    )
+
     eval_url = st.text_input(
         "Evaluation Server URL",
-        value=os.getenv("EVAL_SERVER_URL", "http://localhost:8080"),
+        value=default_eval_url,
         help="FastAPI / Docker endpoint or Tunnel URL"
     )
 
@@ -124,7 +153,7 @@ with st.sidebar:
     if server_online:
         st.success("🟢 Evaluation Server Connected")
     else:
-        st.warning("🔴 Server Unreachable (Check Tunnel/Docker)")
+        st.info("🟡 Offline / Standalone Dataset Active")
 
     st.markdown("---")
     st.subheader("⚡ Quick Controls")
@@ -134,13 +163,16 @@ with st.sidebar:
             st.error(f"Cannot find `main.py` at expected path: `{MAIN_PY_PATH}`.")
         else:
             with st.status(f"Executing audit pipeline on {sample_size} emails...", expanded=True) as status_box:
-                st.write("Initializing inbox connection...")
+                st.write("Configuring environment...")
                 st.write(f"Classifying intent & extracting entities (limit = {sample_size})...")
                 
                 env = os.environ.copy()
                 env["EVAL_SERVER_URL"] = eval_url
                 env["BATCH_LIMIT"] = str(sample_size)
                 
+                if openrouter_key:
+                    env["OPENROUTER_API_KEY"] = openrouter_key
+
                 result = subprocess.run(
                     [sys.executable, MAIN_PY_PATH, "--limit", str(sample_size)],
                     cwd=BASE_DIR,
@@ -170,7 +202,9 @@ with st.sidebar:
         )
 
 
-# MAIN DASHBOARD
+# ==========================================
+# MAIN DASHBOARD CONTENT
+# ==========================================
 st.title("Automated Shipping Document Auditor")
 st.markdown("Parse logistics communications, cross-examine Shipping Instructions (SI) against Bills of Lading (BL), and escalate edge cases automatically.")
 
