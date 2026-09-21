@@ -16,8 +16,7 @@ sys.path.append(os.path.join(BASE_DIR, "data_averis", "server"))
 
 from data_averis.server.loader import Inbox
 from classifier import classify_email
-from extractor import extract_shipment_details
-from comparator import compare_shipments, TARGET_FIELDS
+import hackathonprototype as hp
 
 load_dotenv()
 
@@ -105,60 +104,9 @@ def process_email(email_raw: Any, inbox: Inbox) -> dict:
     if category != "BL_COMPARISON":
         return record
 
-    si_rel_path, bl_rel_path = get_attachment_paths(email)
-
-    if not si_rel_path or not bl_rel_path:
-        email_id = str(email.get("email_id") or email.get("id") or "")
-        if email_id.startswith("email_5") or "email_50" in email_id or "email_51" in email_id or "email_52" in email_id:
-            record["status"] = "NEEDS_REVIEW"
-            record["review_reason"] = "missing_attachment"
-        return record
-
-    try:
-        si_text = read_attachment_from_inbox(inbox, si_rel_path)
-        bl_text = read_attachment_from_inbox(inbox, bl_rel_path)
-    except Exception:
-        record["status"] = "NEEDS_REVIEW"
-        record["review_reason"] = "unreadable"
-        return record
-
-    if not si_text or not bl_text or len(si_text.strip()) < 15 or len(bl_text.strip()) < 15:
-        record["status"] = "NEEDS_REVIEW"
-        record["review_reason"] = "unreadable"
-        return record
-
-    combined_docs = f"{si_text} {bl_text}".upper()
-    wrong_type_triggers = ["COMMERCIAL INVOICE", "PACKING LIST", "CERTIFICATE OF ORIGIN", "TAX INVOICE"]
-    if any(trigger in combined_docs for trigger in wrong_type_triggers):
-        if not ("BILL OF LADING" in combined_docs or "SHIPPING INSTRUCTION" in combined_docs):
-            record["status"] = "NEEDS_REVIEW"
-            record["review_reason"] = "wrong_doc_type"
-            return record
-
-    missing_value_placeholders = ["???", "_______", "TBA", "TO BE ADVISED", "PENDING"]
-    if any(ph in si_text for ph in missing_value_placeholders):
-        record["status"] = "NEEDS_REVIEW"
-        record["review_reason"] = "missing_value"
-        return record
-
-    try:
-        si_details = extract_shipment_details(si_text, doc_type="SI")
-        bl_details = extract_shipment_details(bl_text, doc_type="BL")
-    except Exception:
-        record["status"] = "NEEDS_REVIEW"
-        record["review_reason"] = "unreadable"
-        return record
-
-    si_dict = getattr(si_details, "model_dump", lambda: si_details)()
-    bl_dict = getattr(bl_details, "model_dump", lambda: bl_details)()
-
-    has_mismatch, mismatches = compare_shipments(si_dict, bl_dict)
-    if has_mismatch:
-        record["has_defect"] = True
-        record["defect_fields"] = list(mismatches.keys())
-        if record["status"] == "OK":
-            record["status"] = "MISMATCH"
-
+    # Deterministic SI-vs-BL stage (handles txt/pdf/docx/xlsx, label matching, review reasons).
+    decision, _details = hp.analyse_bl_comparison(inbox, email)
+    record.update(decision)
     return record
 
 
