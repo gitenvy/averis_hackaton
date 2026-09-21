@@ -910,7 +910,7 @@ def load_inbox(bundle: Path):
     """Load the provided Inbox class without copying the dataset."""
 
     sys.path.insert(0, str(bundle))
-    from loader import Inbox
+    from data_averis.server.loader import Inbox
 
     return Inbox(str(bundle))
 
