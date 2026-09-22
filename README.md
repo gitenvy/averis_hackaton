@@ -1,247 +1,180 @@
-# Automated Shipping Document Auditor
+# AI Shipping Auditor
 
-An enterprise-grade AI verification pipeline and Human-in-the-Loop (HITL) auditing dashboard designed to streamline logistics communications, cross-examine Shipping Instructions (SI) against Bills of Lading (BL), and automatically flag operational discrepancies or edge cases.
+A hybrid ML + LLM pipeline that classifies inbound logistics email and automatically cross-checks Shipping Instruction (SI) vs draft Bill of Lading (BL) documents — built for the SDOC Hackathon, Document Intelligence track.
 
----
-
-## Key Features
-
-* Hybrid Email Intent Classification: Automatically categorizes incoming logistics communications into BL_COMPARISON, SI_REQUEST, INVOICE_QUERY, GENERAL, or SPAM.
-* Multi-Format Attachment Extraction: Reads and parses structured data across plain text, PDF, Word (.docx), and Excel (.xlsx) files.
-* Unit & String Normalization:
-  - Weight Normalization: Automatically converts Metric Tons (MT) to Kilograms (KG) with a 1 kg rounding tolerance to eliminate false mismatches.
-  - Order-Insensitive Token Matching: Strips punctuation and matches address, port, and company name tokens regardless of minor formatting variations.
-* Field-Level Discrepancy Auditing: Compares 7 canonical shipment fields: shipper, consignee, notify_party, port_of_loading, port_of_discharge, container_count, gross_weight_kg.
-* Automated Escalation Management: Escalates unreadable files, missing attachments, incorrect document types, or placeholder values to NEEDS_REVIEW status.
-* Rate-Limit & Free-Tier Friendly: Built with exponential backoff retries (for HTTP 429 rate limits) and sequential delay pacing to strictly support free-tier LLM API keys.
-* Plug-and-Play Offline Execution: Automatically detects and falls back to local dataset directories (offline_inbox/ or data_averis/) when an active evaluation server is offline.
-* Interactive HITL Dashboard: Streamlit interface featuring real-time metrics, a field-by-field Document Diff Inspector, and a Supervisor Escalation Portal with session-persistent overrides.
+Runs completely free by default (deterministic rules + a local scikit-learn model). An LLM call is used only as an optional, confidence-gated fallback for the emails the local stages genuinely can't resolve.
 
 ---
 
-## Architecture & Pipeline Flow
+## Table of contents
 
-[ Incoming Email & Attachments ]
-              │
-              ▼
-    [ Intent Classifier ] ──► (If NOT BL_COMPARISON) ──► Mark Status: OK
-              │
-              ▼ (If BL_COMPARISON)
-   [ Document Parser & Extractor ]
-              │
-              ├─► Missing Attachments / Unreadable ──► Mark Status: NEEDS_REVIEW
-              │
-              ▼
-  [ Field Comparison Engine ]
-  (SI vs BL Cross-Examination)
-              │
-              ├─► Field Discrepancies Detected ──► Mark Status: MISMATCH (Flag Defect Fields)
-              │
-              └─► Field Match Verified ─────────► Mark Status: OK
+- [Problem](#problem)
+- [Solution](#solution)
+- [Tech stack](#tech-stack)
+- [Architecture](#architecture)
+- [Results / success metrics](#results--success-metrics)
+- [Setup](#setup)
+- [Usage](#usage)
+- [Problem–solution alignment](#problemsolution-alignment)
+- [AI and cloud infrastructure integration](#ai-and-cloud-infrastructure-integration)
+- [User feedback / testing](#user-feedback--testing)
+- [Coding challenges](#coding-challenges)
+- [Scalability plans](#scalability-plans)
+- [Repository structure](#repository-structure)
+- [License](#license)
 
 ---
 
-## Complete Setup & Installation Guide
+## Problem
 
-### Prerequisites
-* Python: 3.10 or higher
-* Git: Installed on your system
-* API Key: An OpenRouter or Groq API key for LLM inference
+Shipping and logistics teams triage hundreds of inbound emails a day across five intents — BL comparisons, SI requests, invoice queries, general operations, and spam. For every BL comparison request, someone has to manually cross-reference **7 canonical fields** (shipper, consignee, weight, port, container count, etc.) between the Shipping Instruction and the draft Bill of Lading, using labels that are rarely identical between the two documents. A missed mismatch on a field like consignee or weight can delay a vessel or trigger a costly claim. This is slow, repetitive, and error-prone at scale.
 
----
+## Solution
 
-### Option A: Local Setup
+AI Shipping Auditor automates the full pipeline: classify the email's intent, extract the relevant document fields, and verify them against each other — escalating to a human (or an LLM) only when it's genuinely unsure, rather than guessing.
 
-1. Clone the Repository
-   git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
-   cd YOUR_REPO
+## Tech stack
 
-2. Create and Activate a Virtual Environment
-   On Windows (PowerShell):
-     python -m venv venv
-     .\venv\Scripts\Activate.ps1
-   On macOS / Linux:
-     python3 -m venv venv
-     source venv/bin/activate
+**Classification**
+- `scikit-learn` — TF-IDF (word n-grams + character n-grams, on subject and body separately) feeding a `LogisticRegression` classifier
+- Structural/rule-based features — attachment presence, sender domain, reply detection
+- `OpenRouter` (Llama 3.3 70B) — optional LLM fallback, used only on low-confidence cases
+- Deterministic keyword-rule fallback — used automatically when no LLM API key is configured, so the system always has a free path
 
-3. Install Dependencies
-   pip install -r requirements.txt
+**Document parsing**
+- `pdfplumber` — label/value extraction from PDF attachments
+- `python-docx` — paragraph and table extraction from Word attachments
+- `openpyxl` / `pandas` — spreadsheet attachments
 
-4. Configure Environment Variables
-   Create a .env file in the root directory:
-     OPENROUTER_API_KEY=your_openrouter_api_key_here
-     EVAL_SERVER_URL=http://localhost:8080
-     BATCH_LIMIT=20
+**Comparison & matching**
+- Fuzzy label matching — word overlap, acronym matching, and `difflib.SequenceMatcher` character similarity, to line up fields that are named differently across documents (e.g. "Port of Loading" vs "POL" vs "Load Port")
+- Unit normalization — weights (KG/MT) and container counts, before exact comparison
 
-5. Verify Dataset Placement
-   Ensure your offline dataset folder (offline_inbox/ or data_averis/) is present in the project directory. The pipeline will automatically load records from this folder if no active server is detected.
+**App & delivery**
+- `Streamlit` — dashboard (audit log, document diff inspector, live single-email tester, accuracy-vs-ground-truth view, supervisor portal)
+- `FastAPI` / Docker — evaluation server
+- `joblib` — trained model persistence
 
-6. Run the Application
-   Launch the Interactive Dashboard:
-     python -m streamlit run app.py
-   Open your browser at http://localhost:8501.
+## Architecture
 
-   Run the CLI Pipeline Directly:
-     python main.py --limit 20
-     python main.py
+A cost-ordered cascade: every email is handled by the **cheapest stage** that can decide it confidently, so paid inference is the exception, not the default path.
 
----
+```
+Email in
+   │
+   ▼
+1. Attachment rule        →  _SI / _BL file pair present?           free · instant
+   │ (no match)
+   ▼
+2. Local ML model         →  TF-IDF + logistic regression,          free · ~ms
+   │ (confidence < 45%)       confidence ≥ 45% required
+   ▼
+3. LLM (OpenRouter)        →  low-confidence cases only,             paid · seconds
+   │ (no API key set)          if a key is configured
+   ▼
+4. Keyword fallback        →  deterministic rules                    free · instant
+```
 
-### Option B: Streamlit Cloud Deployment (Zero-Server Plug & Play)
+For `BL_COMPARISON` emails, the matched SI and BL attachments are parsed, fields are fuzzy-matched to 7 canonical labels, values are normalized, and each field is marked `MATCHED`, `NOT_MATCHED`, or `REVIEW_NEEDED`. Emails that can't be resolved safely (unreadable scan, missing attachment, missing value, wrong document type) are escalated to `NEEDS_REVIEW` instead of guessed.
 
-1. Push Code and Offline Inbox to GitHub
-   Ensure your local dataset folder (offline_inbox/) is committed to Git so Streamlit Cloud can load files without requiring an external container:
-     git add app.py main.py classifier.py extractor.py comparator.py offline_inbox/ requirements.txt
-     git commit -m "Configure project for Streamlit Cloud deployment"
-     git push origin main
+## Results / success metrics
 
-2. Deploy on Streamlit Cloud
-   1. Go to share.streamlit.io and log in with GitHub.
-   2. Click New app.
-   3. Select your Repository, Branch (main), and set Main file path to app.py.
-   4. Click Deploy!
+Scored against the official hackathon metric:
+`FINAL SCORE = 0.3 × Stage-1 macro-F1 + 0.2 × Stage-3 defect-F1 + 0.5 × end-to-end defect recovery`
 
-3. Add Secrets to Streamlit Cloud
-   1. In your deployed app dashboard, click Manage app -> Settings -> Secrets.
-   2. Add your keys in TOML format:
-      OPENROUTER_API_KEY = "sk-or-v1-your-key-here"
-      EVAL_SERVER_URL = "http://localhost:8080"
-   3. Click Save. The dashboard will auto-load these credentials upon launch.
+| Test set | Final score | Notes |
+|---|---|---|
+| Original hackathon dataset (keyword-only baseline) | 0.9825 | For comparison |
+| Original hackathon dataset (this hybrid pipeline) | **1.0000** | Perfect on seen data |
+| Independently-worded, unseen dataset | **0.9133** | New wording never trained on |
+| Hand-built hard/complex cases | **0.6838** | Non-English, phishing, forwarded threads, negations, multi-intent |
 
----
+We deliberately built a **second, independently-worded dataset** (different templates, senders, phrasing) to avoid grading ourselves on memorized templates — the 1.0 score on the original data does not imply real-world generalization by itself, and the unseen/complex numbers above are the honest read.
 
-### Option C: Optional Docker Server Integration
+**Cost efficiency:** on unseen data, **83–87% of emails are resolved confidently by the free local stages alone** — only about 1 in 5 emails ever reaches the paid LLM step. Stage 3 (SI vs BL field comparison) held perfect precision and recall across every test split.
 
-If you are evaluating against an active FastAPI or Docker service endpoint:
+## Setup
 
-1. Launch your container:
-   docker run -p 8080:8080 my-eval-server-image
+```bash
+git clone <this-repo>
+cd shipping_verifier
+pip install -r requirements.txt
+```
 
-2. Set EVAL_SERVER_URL in .env or in the Streamlit UI to http://localhost:8080 (or your active tunnel URL).
-3. The system will automatically run health checks and route requests through the evaluation server.
+Optional — enable the LLM fallback (skips automatically if unset):
 
----
+```bash
+export OPENROUTER_API_KEY="your-key-here"
+```
 
-## Streamlit Dashboard Walkthrough
+Train / retrain the local model:
 
-1. Audit Summary & Logs: Interactive KPI cards, searchable logs, category filters, and distribution charts.
-2. Document Diff Inspector: Field-by-field comparison matrix cross-examining extracted Shipping Instructions against draft Bills of Lading.
-3. Supervisor Escalation Portal: Dedicated Human-in-the-Loop decision console for manual audit overrides, status adjustments, and note logging.
+```bash
+python train_model.py --bundle <path-to-email-bundle> --labels ground_truth.json --out model.joblib
+```
 
----
+## Usage
 
-## Directory Structure
+Run the batch pipeline:
 
-.
-├── app.py                  # Streamlit web dashboard interface
-├── main.py                 # Core batch processing pipeline & fallback loader
-├── classifier.py           # Email intent classification module
-├── extractor.py            # Entity extraction module (SI/BL documents)
-├── comparator.py           # Normalization & field comparison engine
-├── requirements.txt        # Python dependencies
-├── offline_inbox/          # Standalone offline dataset directory
-└── submission.json         # Pipeline evaluation output payload
+```bash
+python main.py --bundle <path-to-email-bundle>
+```
 
+Launch the dashboard:
 
+```bash
+streamlit run app.py
+```
 
+The dashboard has five tabs: **Audit Summary & Logs** (KPIs, filters, decision source/confidence), **Document Diff Inspector** (field-level SI vs BL comparison), **Live Tester** (paste or upload a single email to run through the full pipeline), **Accuracy vs Ground Truth** (upload any `ground_truth.json` to get the official tester metrics inline), and **Supervisor Portal** (human-in-the-loop review queue).
 
+## Problem–solution alignment
 
+The core problem is manual, error-prone, field-by-field document reconciliation at email scale. The solution addresses this directly and only this: it does not try to replace human judgment on ambiguous cases, it routes them to `NEEDS_REVIEW` or an optional LLM/human step. Every design decision — the cascade order, the confidence threshold, the fuzzy label matching — traces back to reducing manual triage time without introducing silent misclassification risk on a domain (shipping documents) where a wrong "match" is more costly than a flagged review.
 
-TEAMMATE ONBOARDING & QUICKSTART GUIDE
+## AI and cloud infrastructure integration
 
-This guide walks you through setting up and running the Automated Shipping Document Auditor locally on your machine.
+- **Local ML** (scikit-learn) does the bulk of classification work with no external dependency or per-call cost.
+- **LLM integration** (OpenRouter, Llama 3.3 70B) is wired in as an explicit, optional, confidence-gated fallback rather than the primary classifier — it is only invoked when the local model's confidence falls below threshold, keeping inference costs proportional to genuine difficulty rather than volume.
+- **Containerization**: the evaluation server runs via FastAPI + Docker, so grading/scoring is reproducible and isolated from the local dev environment.
+- The architecture is provider-agnostic at the LLM layer — swapping OpenRouter for another provider only touches one module (`llm_classifier.py`).
 
-========================================================================
-1. PREREQUISITES
-========================================================================
-Before starting, ensure you have installed:
-- Python: 3.10 or higher (https://www.python.org/downloads/)
-- Git: Installed and configured on your system
-- API Key: An OpenRouter API key (or Groq API key) for LLM inference
+## User feedback / testing
 
-========================================================================
-2. LOCAL SETUP
-========================================================================
-Step 1: Clone the Repository
-  git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
-  cd YOUR_REPO
+- Automated testing: `streamlit.testing.v1.AppTest` for headless dashboard smoke tests, plus `StratifiedKFold` / `GroupKFold` cross-validation (grouping near-duplicate templated emails to prevent train/test leakage).
+- Hand-written "paraphrase" emails used to sanity-check true generalization vs template memorization during development.
+- A dedicated, independently-worded dataset (`train_varied` / `unseen_test` / `complex_llm` splits) built specifically to expose and quantify the gap between seen-data accuracy and real-world accuracy, rather than relying on the original dataset's score alone.
+- The dashboard's **Live Tester** tab exists specifically so a reviewer (human-in-the-loop) can paste in an arbitrary email and immediately see which stage decided it, at what confidence, and why — surfacing model behavior for ongoing feedback rather than treating it as a black box.
 
-Step 2: Set Up Virtual Environment
-  On Windows (PowerShell):
-    python -m venv venv
-    .\venv\Scripts\Activate.ps1
-    (If you get an ExecutionPolicy error in PowerShell, run:
-     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass)
+## Coding challenges
 
-  On macOS / Linux:
-    python3 -m venv venv
-    source venv/bin/activate
+- **Templated data hides real accuracy** — scoring against the same generated dataset used for training produced a misleading 1.00. Solved by building a separate, differently-worded dataset to get an honest read.
+- **Sender-domain features overfit** — the model learned to treat unfamiliar domains (e.g. `gmail.com`) as a spam signal. Removing sender-domain features improved unseen-data accuracy from ~72% to ~82%.
+- **Field label matching across formats** — SI and BL documents label the same field differently (e.g. "Port of Loading" vs "POL" vs "Load Port"). Solved with acronym-aware fuzzy scoring instead of a fixed alias list.
+- **Keeping the LLM optional** — the system had to run fully free with no API key configured, and upgrade gracefully once one is added, without the keyword fallback ever becoming the primary path in a configured environment.
 
-Step 3: Install Dependencies
-  pip install -r requirements.txt
+## Scalability plans
 
-Step 4: Configure Environment Variables
-  Create a file named .env in the root folder of the repository:
-    OPENROUTER_API_KEY=sk-or-v1-your-key-here
-    EVAL_SERVER_URL=http://localhost:8080
-    BATCH_LIMIT=20
+- **Harden the classifier** (now → +1 month): collect real, anonymized inbox data to retrain beyond synthetic templates; add an active-learning loop that logs every low-confidence + LLM decision for retraining.
+- **Extend document coverage** (+1 → +3 months): OCR fallback for scanned/image-only attachments; move from alias-list field matching to embedding-based semantic matching.
+- **Production readiness** (+3 months →): wire the human-in-the-loop review queue to a real ticketing system; add SLA dashboards, an audit trail, and role-based access for the supervisor portal.
 
-  Note: If you don't create a .env file, you can paste your API key
-  directly into the sidebar of the Streamlit app when it launches.
+## Repository structure
 
-========================================================================
-3. RUNNING THE PROJECT
-========================================================================
-Mode A: Web Interface (Streamlit UI) - Recommended
-  Launch the visual audit dashboard:
-    python -m streamlit run app.py
+```
+shipping_verifier/
+├── main.py                # Batch pipeline entry point
+├── classifier.py          # Hybrid classifier (rule → ML → LLM → keyword fallback)
+├── llm_classifier.py       # OpenRouter-based LLM fallback
+├── ml_pipeline.py          # TF-IDF + logistic regression classifier
+├── hackathonprototype.py   # Stage 3 SI/BL comparison engine
+├── train_model.py          # Model training CLI
+├── model.joblib            # Trained model artifact
+├── app.py                  # Streamlit dashboard
+├── requirements.txt
+└── varied_dataset/          # Independently-worded train/unseen/complex test splits
+```
 
-  - Your browser will automatically open to http://localhost:8501.
-  - How to run a batch:
-    1. Select your target Sample Size using the sidebar slider (default: 20).
-    2. Click "Run Audit Pipeline".
-    3. Inspect results under Audit Summary & Logs, cross-examine fields in
-       Document Diff Inspector, or test manual approvals in Supervisor Portal.
-
-Mode B: Direct CLI Execution (Terminal)
-  To run the pipeline in headless mode and generate submission.json:
-    python main.py --limit 20   (Processes a 20-email sample batch)
-    python main.py              (Processes the full dataset)
-
-========================================================================
-4. EXECUTION MODES: OFFLINE VS. DOCKER
-========================================================================
-1. Plug-and-Play Offline Mode (Default / No Setup):
-   If no Docker server is running, main.py automatically detects and reads
-   local emails and attachments from the ./offline_inbox directory. You do
-   not need to launch Docker to test the app.
-
-2. Docker Evaluation Server Mode (Optional):
-   If you have the evaluation container running on http://localhost:8080,
-   main.py automatically detects it and processes requests over HTTP instead.
-
-========================================================================
-5. TROUBLESHOOTING & COMMON GOTCHAS
-========================================================================
-- HTTP 429 / Rate Limit Warnings:
-  The pipeline uses free-tier API pacing with automatic exponential retries.
-  If rate limit warnings appear in the console, the script will automatically
-  pause, wait, and retry. Do not cancel execution.
-
-- Module Not Found Errors:
-  Ensure your virtual environment is active ((venv) should appear at the
-  start of your terminal prompt).
-
-- Missing submission.json:
-  The dashboard requires submission.json to render historical logs. Click
-  "Run Audit Pipeline" in the sidebar once to generate your first audit run.
-
-========================================================================
-6. KEY FILE OVERVIEW
-========================================================================
-- app.py: Streamlit frontend dashboard logic, HITL portal, and metrics.
-- main.py: Pipeline entry point, multi-directory fallback loader, and batching.
-- classifier.py: Email intent classification logic (BL_COMPARISON, GENERAL, etc.).
-- extractor.py: Structured entity extraction for SI and draft BL documents.
-- comparator.py: Unit conversions (MT to KG), token normalization, and field comparison.
-- offline_inbox/: Local sample dataset directory for zero-dependency development.
+# Repository clone URL
+https://github.com/gitenvy/averis_hackaton.git
